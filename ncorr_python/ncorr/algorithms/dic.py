@@ -1521,14 +1521,6 @@ class DICAnalysis:
             ui = np.array(batch_u_init, dtype=np.float64)
             vi = np.array(batch_v_init, dtype=np.float64)
 
-            # STEP 1: Refine initial guesses with local NCC search
-            # This prevents banding by ensuring we start in the correct basin
-            ui_refined, vi_refined = _refine_initial_guesses_parallel(
-                ref_bcoef, cur_bcoef, border,
-                px, py, ui, vi,
-                radius, 3,  # search_radius = ±3 pixels
-            )
-
             # Get strain initial guesses from stored data
             dudxi = np.zeros(len(px), dtype=np.float64)
             dudyi = np.zeros(len(px), dtype=np.float64)
@@ -1544,13 +1536,13 @@ class DICAnalysis:
                 print(f"\nDEBUG First batch:")
                 print(f"  Number of points: {len(px)}")
                 for i in range(min(5, len(px))):
-                    print(f"  Point {i}: ({px[i]}, {py[i]}) init u={ui[i]:.4f}, v={vi[i]:.4f} -> refined u={ui_refined[i]:.4f}, v={vi_refined[i]:.4f}")
+                    print(f"  Point {i}: ({px[i]}, {py[i]}) init u={ui[i]:.4f}, v={vi[i]:.4f}")
 
-            # STEP 2: Process in parallel with AFFINE model (captures strain)
+            # Process in parallel with AFFINE model (captures strain)
             (u_res, v_res, dudx_res, dudy_res, dvdx_res, dvdy_res,
              cc_res, conv_res, iter_res) = _process_points_parallel(
                 ref_bcoef, cur_bcoef, border,
-                px, py, ui_refined, vi_refined, dudxi, dudyi, dvdxi, dvdyi,
+                px, py, ui, vi, dudxi, dudyi, dvdxi, dvdyi,
                 radius, cutoff_diffnorm, cutoff_iteration,
             )
 
