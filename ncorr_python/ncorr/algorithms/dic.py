@@ -942,6 +942,63 @@ def _check_point_in_region(
 
 
 @njit(cache=True, parallel=True)
+def _process_points_parallel_translation(
+    ref_bcoef: NDArray[np.float64],
+    cur_bcoef: NDArray[np.float64],
+    border: int,
+    points_x: NDArray[np.int32],
+    points_y: NDArray[np.int32],
+    u_init: NDArray[np.float64],
+    v_init: NDArray[np.float64],
+    radius: int,
+    cutoff_diffnorm: float,
+    cutoff_iteration: int,
+) -> Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64],
+           NDArray[np.bool_], NDArray[np.int32]]:
+    """
+    Process multiple points in parallel using translation-only warp model.
+
+    This is more robust for large displacements with small strain.
+
+    Args:
+        ref_bcoef: Reference B-spline coefficients
+        cur_bcoef: Current B-spline coefficients
+        border: Border size
+        points_x, points_y: Point coordinates
+        u_init, v_init: Initial displacement guesses
+        radius: Subset radius
+        cutoff_diffnorm: Convergence threshold
+        cutoff_iteration: Maximum iterations
+
+    Returns:
+        Tuple of (u, v, corrcoef, converged, iterations) arrays
+    """
+    n_points = len(points_x)
+
+    u_out = np.empty(n_points, dtype=np.float64)
+    v_out = np.empty(n_points, dtype=np.float64)
+    cc_out = np.empty(n_points, dtype=np.float64)
+    conv_out = np.empty(n_points, dtype=np.bool_)
+    iter_out = np.empty(n_points, dtype=np.int32)
+
+    for idx in prange(n_points):
+        u, v, cc, conv, n_iter = _ic_gn_translation(
+            ref_bcoef, cur_bcoef, border,
+            points_x[idx], points_y[idx], radius,
+            u_init[idx], v_init[idx],
+            cutoff_diffnorm, cutoff_iteration,
+        )
+
+        u_out[idx] = u
+        v_out[idx] = v
+        cc_out[idx] = cc
+        conv_out[idx] = conv
+        iter_out[idx] = n_iter
+
+    return u_out, v_out, cc_out, conv_out, iter_out
+
+
+@njit(cache=True, parallel=True)
 def _process_points_parallel(
     ref_bcoef: NDArray[np.float64],
     cur_bcoef: NDArray[np.float64],
@@ -1182,8 +1239,8 @@ class DICAnalysis:
         """
         Process a single region using flood-fill from seed.
 
-        Uses 6-parameter affine model with strain propagation for accurate
-        displacement field estimation in samples with strain.
+        Uses 2-parameter translation model which is more robust for
+        large displacements with small strain variations.
         """
         radius = self.params.radius
         cutoff_diffnorm = self.params.cutoff_diffnorm
@@ -1201,9 +1258,8 @@ class DICAnalysis:
         out_h, out_w = u_plot.shape
 
         # Queue for flood-fill processing
-        # Format: (x, y, u_guess, v_guess, dudx, dudy, dvdx, dvdy)
-        # Initialize with seed and zero strain
-        queue = deque([(seed.x, seed.y, seed.u, seed.v, 0.0, 0.0, 0.0, 0.0)])
+        # Format: (x, y, u_guess, v_guess)
+        queue = deque([(seed.x, seed.y, seed.u, seed.v)])
         processed = set()
         points_processed = 0
 
@@ -1220,15 +1276,11 @@ class DICAnalysis:
         batch_points_y = []
         batch_u_init = []
         batch_v_init = []
-        batch_dudx_init = []
-        batch_dudy_init = []
-        batch_dvdx_init = []
-        batch_dvdy_init = []
         batch_ox = []
         batch_oy = []
 
         def process_batch():
-            """Process accumulated batch of points in parallel."""
+            """Process accumulated batch of points in parallel using translation model."""
             nonlocal points_processed, last_progress_percent
 
             if not batch_points_x:
@@ -1239,16 +1291,11 @@ class DICAnalysis:
             py = np.array(batch_points_y, dtype=np.int32)
             ui = np.array(batch_u_init, dtype=np.float64)
             vi = np.array(batch_v_init, dtype=np.float64)
-            dudxi = np.array(batch_dudx_init, dtype=np.float64)
-            dudyi = np.array(batch_dudy_init, dtype=np.float64)
-            dvdxi = np.array(batch_dvdx_init, dtype=np.float64)
-            dvdyi = np.array(batch_dvdy_init, dtype=np.float64)
 
-            # Process in parallel with affine model
-            (u_res, v_res, dudx_res, dudy_res, dvdx_res, dvdy_res,
-             cc_res, conv_res, iter_res) = _process_points_parallel(
+            # Process in parallel with translation model (more robust)
+            u_res, v_res, cc_res, conv_res, iter_res = _process_points_parallel_translation(
                 ref_bcoef, cur_bcoef, border,
-                px, py, ui, vi, dudxi, dudyi, dvdxi, dvdyi,
+                px, py, ui, vi,
                 radius, cutoff_diffnorm, cutoff_iteration,
             )
 
@@ -1266,45 +1313,31 @@ class DICAnalysis:
                     iterations[oy, ox] = iter_res[idx]
                     points_processed += 1
 
-                    # Add neighbors to queue with good results
+                    # Add neighbors to queue
                     x = batch_points_x[idx]
                     y = batch_points_y[idx]
 
                     if cc_res[idx] >= min_cc_for_propagation:
-                        # Use strain parameters to predict displacement at neighbors
-                        # This greatly improves convergence for samples with strain
+                        # Propagate with current displacement as initial guess
                         cur_u = u_res[idx]
                         cur_v = v_res[idx]
-                        cur_dudx = dudx_res[idx]
-                        cur_dudy = dudy_res[idx]
-                        cur_dvdx = dvdx_res[idx]
-                        cur_dvdy = dvdy_res[idx]
 
-                        # Propagate to neighbors with strain-based prediction
                         for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
                             nx, ny = x + dx, y + dy
                             if (nx, ny) not in processed:
-                                # Predict displacement at neighbor using strain
-                                next_u = cur_u + cur_dudx * dx + cur_dudy * dy
-                                next_v = cur_v + cur_dvdx * dx + cur_dvdy * dy
-                                queue.append((nx, ny, next_u, next_v,
-                                             cur_dudx, cur_dudy, cur_dvdx, cur_dvdy))
+                                queue.append((nx, ny, cur_u, cur_v))
                     else:
                         # Fall back to seed displacement
                         for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
                             nx, ny = x + dx, y + dy
                             if (nx, ny) not in processed:
-                                queue.append((nx, ny, seed.u, seed.v, 0.0, 0.0, 0.0, 0.0))
+                                queue.append((nx, ny, seed.u, seed.v))
 
             # Clear batch
             batch_points_x.clear()
             batch_points_y.clear()
             batch_u_init.clear()
             batch_v_init.clear()
-            batch_dudx_init.clear()
-            batch_dudy_init.clear()
-            batch_dvdx_init.clear()
-            batch_dvdy_init.clear()
             batch_ox.clear()
             batch_oy.clear()
 
@@ -1321,7 +1354,7 @@ class DICAnalysis:
         while queue or batch_points_x:
             # Fill batch from queue
             while queue and len(batch_points_x) < batch_size:
-                x, y, u_guess, v_guess, dudx_g, dudy_g, dvdx_g, dvdy_g = queue.popleft()
+                x, y, u_guess, v_guess = queue.popleft()
 
                 # Convert to output coordinates
                 ox, oy = x // step, y // step
@@ -1343,10 +1376,6 @@ class DICAnalysis:
                 batch_points_y.append(y)
                 batch_u_init.append(u_guess)
                 batch_v_init.append(v_guess)
-                batch_dudx_init.append(dudx_g)
-                batch_dudy_init.append(dudy_g)
-                batch_dvdx_init.append(dvdx_g)
-                batch_dvdy_init.append(dvdy_g)
                 batch_ox.append(ox)
                 batch_oy.append(oy)
 
