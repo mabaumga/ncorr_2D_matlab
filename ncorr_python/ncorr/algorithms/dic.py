@@ -1539,39 +1539,71 @@ class DICAnalysis:
                     print(f"  Point {i}: u={u_res[i]:.4f}, v={v_res[i]:.4f}, CC={cc_res[i]:.4f}, conv={conv_res[i]}, iter={iter_res[i]}")
                 debug_batch_count[0] += 1
 
-            # Store results
+            # Store results and check consistency
             for idx in range(len(batch_points_x)):
                 ox = batch_ox[idx]
                 oy = batch_oy[idx]
+                x = batch_points_x[idx]
+                y = batch_points_y[idx]
 
-                if not np.isnan(u_res[idx]):
-                    u_plot[oy, ox] = u_res[idx]
-                    v_plot[oy, ox] = v_res[idx]
-                    corrcoef_plot[oy, ox] = cc_res[idx]
-                    roi_plot[oy, ox] = True
-                    converged[oy, ox] = conv_res[idx]
-                    iterations[oy, ox] = iter_res[idx]
-                    points_processed += 1
+                if np.isnan(u_res[idx]):
+                    continue
 
-                    # Add neighbors to queue
-                    x = batch_points_x[idx]
-                    y = batch_points_y[idx]
+                u_result = u_res[idx]
+                v_result = v_res[idx]
+                cc_result = cc_res[idx]
 
-                    if cc_res[idx] >= min_cc_for_propagation:
-                        # Simple propagation: just pass the displacement
-                        cur_u = u_res[idx]
-                        cur_v = v_res[idx]
+                # Consistency check: compare with already-processed neighbors
+                # If displacement differs too much, re-try with neighbor's value
+                neighbor_offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+                for nox, noy in neighbor_offsets:
+                    nx_out, ny_out = ox + nox, oy + noy
+                    if 0 <= ny_out < out_h and 0 <= nx_out < out_w:
+                        if roi_plot[ny_out, nx_out] and not np.isnan(u_plot[ny_out, nx_out]):
+                            neighbor_u = u_plot[ny_out, nx_out]
+                            neighbor_v = v_plot[ny_out, nx_out]
 
-                        for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
-                            nx, ny = x + dx, y + dy
-                            if (nx, ny) not in processed:
-                                queue.append((nx, ny, cur_u, cur_v))
-                    else:
-                        # Fall back to seed displacement
-                        for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
-                            nx, ny = x + dx, y + dy
-                            if (nx, ny) not in processed:
-                                queue.append((nx, ny, seed.u, seed.v))
+                            # Check if there's a significant jump (> 0.5 pixel)
+                            du = abs(u_result - neighbor_u)
+                            dv = abs(v_result - neighbor_v)
+
+                            if du > 0.5 or dv > 0.5:
+                                # Re-try IC-GN with neighbor's displacement as initial guess
+                                u_retry, v_retry, cc_retry, _, _ = _ic_gn_translation(
+                                    ref_bcoef, cur_bcoef, border,
+                                    x, y, radius,
+                                    neighbor_u, neighbor_v,
+                                    cutoff_diffnorm, cutoff_iteration,
+                                )
+
+                                # Keep the result with higher correlation
+                                if cc_retry > cc_result:
+                                    u_result = u_retry
+                                    v_result = v_retry
+                                    cc_result = cc_retry
+                                    # Only need one successful retry
+                                    break
+
+                # Store the (possibly corrected) result
+                u_plot[oy, ox] = u_result
+                v_plot[oy, ox] = v_result
+                corrcoef_plot[oy, ox] = cc_result
+                roi_plot[oy, ox] = True
+                converged[oy, ox] = conv_res[idx]
+                iterations[oy, ox] = iter_res[idx]
+                points_processed += 1
+
+                # Add neighbors to queue
+                if cc_result >= min_cc_for_propagation:
+                    for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
+                        nx, ny = x + dx, y + dy
+                        if (nx, ny) not in processed:
+                            queue.append((nx, ny, u_result, v_result))
+                else:
+                    for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
+                        nx, ny = x + dx, y + dy
+                        if (nx, ny) not in processed:
+                            queue.append((nx, ny, seed.u, seed.v))
 
             # Clear batch
             batch_points_x.clear()
