@@ -66,6 +66,7 @@ class DICResult:
         roi: ROI mask for valid points
         seed_info: Updated seed information for next image
         converged: Convergence status for each point
+        iterations: Number of iterations used for each point
     """
 
     u: NDArray[np.float64]
@@ -74,6 +75,65 @@ class DICResult:
     roi: NDArray[np.bool_]
     seed_info: List[SeedInfo] = field(default_factory=list)
     converged: Optional[NDArray[np.bool_]] = None
+    iterations: Optional[NDArray[np.int32]] = None
+
+    def get_diagnostics(self) -> dict:
+        """Get convergence diagnostics for the DIC result."""
+        if self.converged is None:
+            return {"error": "No convergence data available"}
+
+        valid_mask = self.roi
+        total_points = np.sum(valid_mask)
+
+        if total_points == 0:
+            return {"error": "No valid points"}
+
+        converged_count = np.sum(self.converged[valid_mask])
+        cc_valid = self.corrcoef[valid_mask]
+
+        diagnostics = {
+            "total_points": int(total_points),
+            "converged_count": int(converged_count),
+            "converged_percent": float(converged_count / total_points * 100),
+            "cc_min": float(np.nanmin(cc_valid)),
+            "cc_max": float(np.nanmax(cc_valid)),
+            "cc_mean": float(np.nanmean(cc_valid)),
+            "cc_median": float(np.nanmedian(cc_valid)),
+            "cc_above_0.9": float(np.sum(cc_valid > 0.9) / len(cc_valid) * 100),
+            "cc_above_0.95": float(np.sum(cc_valid > 0.95) / len(cc_valid) * 100),
+        }
+
+        if self.iterations is not None:
+            iter_valid = self.iterations[valid_mask]
+            diagnostics["iterations_mean"] = float(np.mean(iter_valid))
+            diagnostics["iterations_max"] = int(np.max(iter_valid))
+
+        return diagnostics
+
+    def print_diagnostics(self) -> None:
+        """Print convergence diagnostics."""
+        diag = self.get_diagnostics()
+        if "error" in diag:
+            print(f"Diagnostics error: {diag['error']}")
+            return
+
+        print("=" * 50)
+        print("DIC Convergence Diagnostics")
+        print("=" * 50)
+        print(f"Total points analyzed:    {diag['total_points']:,}")
+        print(f"Converged:                {diag['converged_count']:,} ({diag['converged_percent']:.1f}%)")
+        print(f"Correlation coefficient:")
+        print(f"  Min:                    {diag['cc_min']:.4f}")
+        print(f"  Max:                    {diag['cc_max']:.4f}")
+        print(f"  Mean:                   {diag['cc_mean']:.4f}")
+        print(f"  Median:                 {diag['cc_median']:.4f}")
+        print(f"  Points with CC > 0.90:  {diag['cc_above_0.9']:.1f}%")
+        print(f"  Points with CC > 0.95:  {diag['cc_above_0.95']:.1f}%")
+        if "iterations_mean" in diag:
+            print(f"Iterations:")
+            print(f"  Mean:                   {diag['iterations_mean']:.1f}")
+            print(f"  Max:                    {diag['iterations_max']}")
+        print("=" * 50)
 
 
 # =============================================================================
@@ -326,15 +386,15 @@ def _ic_gn_first_order(
     v_init: float,
     cutoff_diffnorm: float,
     cutoff_iteration: int,
-) -> Tuple[float, float, float, bool]:
+) -> Tuple[float, float, float, bool, int]:
     """
     IC-GN optimization with first-order (affine) warp model.
 
     Uses 6 parameters: [u, du/dx, du/dy, v, dv/dx, dv/dy]
 
     The warp function maps reference subset coordinates to current image:
-    W(Δx, Δy; p) = [x + u + du/dx*Δx + du/dy*Δy]
-                   [y + v + dv/dx*Δx + dv/dy*Δy]
+    W(Δx, Δy; p) = [x + Δx + u + du/dx*Δx + du/dy*Δy]
+                   [y + Δy + v + dv/dx*Δx + dv/dy*Δy]
 
     Args:
         ref_bcoef: Reference image B-spline coefficients
@@ -347,7 +407,7 @@ def _ic_gn_first_order(
         cutoff_iteration: Maximum iterations
 
     Returns:
-        Tuple of (u, v, correlation_coefficient, converged)
+        Tuple of (u, v, correlation_coefficient, converged, iterations)
     """
     size = 2 * radius + 1
     h_ref, w_ref = ref_bcoef.shape
@@ -401,7 +461,7 @@ def _ic_gn_first_order(
 
     # Need minimum valid pixels
     if valid_count < 20:
-        return np.nan, np.nan, np.nan, False
+        return np.nan, np.nan, np.nan, False, 0
 
     # Reference subset statistics
     ref_mean = _masked_mean(ref_subset, mask)
@@ -409,7 +469,7 @@ def _ic_gn_first_order(
     ref_norm = _masked_norm(ref_centered, mask)
 
     if ref_norm < 1e-10:
-        return np.nan, np.nan, np.nan, False
+        return np.nan, np.nan, np.nan, False, 0
 
     # Normalize gradients
     grad_x_norm = ref_dx / ref_norm
@@ -493,8 +553,10 @@ def _ic_gn_first_order(
     # Deformation gradients start at zero (no deformation)
 
     converged = False
+    final_iteration = 0
 
     for iteration in range(cutoff_iteration):
+        final_iteration = iteration + 1
         # Get current subset at warped location
         cur_subset = np.empty((size, size), dtype=np.float64)
         all_valid = True
@@ -618,19 +680,19 @@ def _ic_gn_first_order(
             break
 
     if not all_valid:
-        return np.nan, np.nan, np.nan, False
+        return np.nan, np.nan, np.nan, False, final_iteration
 
     cur_mean = _masked_mean(cur_subset, mask)
     cur_centered = cur_subset - cur_mean
     cur_norm = _masked_norm(cur_centered, mask)
 
     if cur_norm < 1e-10:
-        return np.nan, np.nan, np.nan, False
+        return np.nan, np.nan, np.nan, False, final_iteration
 
     ncc = _compute_ncc(ref_centered, cur_centered, ref_norm, cur_norm, mask)
 
     # Return displacement at subset center (u, v)
-    return p[0], p[3], ncc, converged
+    return p[0], p[3], ncc, converged, final_iteration
 
 
 @njit(cache=True, fastmath=True)
@@ -760,6 +822,7 @@ class DICAnalysis:
         corrcoef_plot = np.full((out_h, out_w), np.nan)
         roi_plot = np.zeros((out_h, out_w), dtype=np.bool_)
         converged = np.zeros((out_h, out_w), dtype=np.bool_)
+        iterations = np.zeros((out_h, out_w), dtype=np.int32)
 
         # Process each seed/region
         updated_seeds = []
@@ -787,7 +850,7 @@ class DICAnalysis:
             points_processed = self._process_region_optimized(
                 ref_bcoef, cur_bcoef, border,
                 region, seed,
-                u_plot, v_plot, corrcoef_plot, roi_plot, converged,
+                u_plot, v_plot, corrcoef_plot, roi_plot, converged, iterations,
                 step,
                 estimated_points
             )
@@ -815,6 +878,7 @@ class DICAnalysis:
             roi=roi_plot,
             seed_info=updated_seeds,
             converged=converged,
+            iterations=iterations,
         )
 
     def _process_region_optimized(
@@ -829,6 +893,7 @@ class DICAnalysis:
         corrcoef_plot: NDArray[np.float64],
         roi_plot: NDArray[np.bool_],
         converged: NDArray[np.bool_],
+        iterations: NDArray[np.int32],
         step: int,
         estimated_points: int = 0,
     ) -> int:
@@ -836,10 +901,15 @@ class DICAnalysis:
         Process a single region using flood-fill from seed.
 
         Optimized version using deque and Numba-accelerated IC-GN.
+        Only propagates results with good correlation (CC > 0.8) to prevent
+        cascade failures.
         """
         radius = self.params.radius
         cutoff_diffnorm = self.params.cutoff_diffnorm
         cutoff_iteration = self.params.cutoff_iteration
+
+        # Minimum correlation to propagate result as initial guess
+        min_cc_for_propagation = 0.8
 
         # Get region data for in-region checking
         leftbound = region.leftbound
@@ -847,7 +917,8 @@ class DICAnalysis:
         nodelist = np.asarray(region.nodelist, dtype=np.int32)
 
         # Queue for flood-fill processing (using deque for efficiency)
-        queue = deque([(seed.x, seed.y, seed.u, seed.v)])
+        # Format: (x, y, u_guess, v_guess, fallback_u, fallback_v)
+        queue = deque([(seed.x, seed.y, seed.u, seed.v, seed.u, seed.v)])
         processed = set()
         points_processed = 0
 
@@ -857,8 +928,12 @@ class DICAnalysis:
         if estimated_points <= 0:
             estimated_points = region.totalpoints // (step * step) if region.totalpoints > 0 else 10000
 
+        # Progress reporting at 1% increments
+        last_progress_percent = -1
+        progress_interval = max(1, estimated_points // 100)
+
         while queue:
-            x, y, u_guess, v_guess = queue.popleft()
+            x, y, u_guess, v_guess, fallback_u, fallback_v = queue.popleft()
 
             # Convert to output coordinates
             ox, oy = x // step, y // step
@@ -876,12 +951,24 @@ class DICAnalysis:
                 continue
 
             # Perform IC-GN optimization with first-order warp (Numba-accelerated)
-            u, v, cc, conv = _ic_gn_first_order(
+            u, v, cc, conv, n_iter = _ic_gn_first_order(
                 ref_bcoef, cur_bcoef, border,
                 x, y, radius,
                 u_guess, v_guess,
                 cutoff_diffnorm, cutoff_iteration,
             )
+
+            # If first attempt failed, try with fallback guess
+            if np.isnan(u) or cc < min_cc_for_propagation:
+                if abs(fallback_u - u_guess) > 0.1 or abs(fallback_v - v_guess) > 0.1:
+                    u2, v2, cc2, conv2, n_iter2 = _ic_gn_first_order(
+                        ref_bcoef, cur_bcoef, border,
+                        x, y, radius,
+                        fallback_u, fallback_v,
+                        cutoff_diffnorm, cutoff_iteration,
+                    )
+                    if not np.isnan(u2) and cc2 > cc:
+                        u, v, cc, conv, n_iter = u2, v2, cc2, conv2, n_iter2
 
             if not np.isnan(u):
                 u_plot[oy, ox] = u
@@ -889,20 +976,33 @@ class DICAnalysis:
                 corrcoef_plot[oy, ox] = cc
                 roi_plot[oy, ox] = True
                 converged[oy, ox] = conv
+                iterations[oy, ox] = n_iter
                 points_processed += 1
+
+                # Determine what to propagate to neighbors
+                # Only propagate good results, otherwise use fallback
+                if cc >= min_cc_for_propagation:
+                    next_u, next_v = u, v
+                    next_fallback_u, next_fallback_v = fallback_u, fallback_v
+                else:
+                    # Bad correlation - use fallback for neighbors
+                    next_u, next_v = fallback_u, fallback_v
+                    next_fallback_u, next_fallback_v = fallback_u, fallback_v
 
                 # Add neighbors to queue
                 for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
                     nx, ny = x + dx, y + dy
                     if (nx, ny) not in processed:
-                        queue.append((nx, ny, u, v))
+                        queue.append((nx, ny, next_u, next_v, next_fallback_u, next_fallback_v))
 
-            # Progress reporting (every 50 points for more responsive updates)
-            if points_processed % 50 == 0 and self._progress_callback:
+            # Progress reporting at 1% increments
+            current_percent = int(points_processed * 100 / max(1, estimated_points))
+            if current_percent > last_progress_percent and self._progress_callback:
+                last_progress_percent = current_percent
                 progress = min(0.99, points_processed / max(1, estimated_points))
                 self._report_progress(
                     progress,
-                    f"Processing... {points_processed}/{estimated_points} points ({progress*100:.0f}%)"
+                    f"Processing... {points_processed:,}/{estimated_points:,} points ({current_percent}%)"
                 )
 
         return points_processed
