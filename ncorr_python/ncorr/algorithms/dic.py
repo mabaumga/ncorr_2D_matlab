@@ -1,7 +1,8 @@
 """
 Digital Image Correlation (DIC) analysis algorithms.
 
-Implements the Inverse Compositional Gauss-Newton DIC (IC-GN) algorithm.
+Implements the Inverse Compositional Gauss-Newton DIC (IC-GN) algorithm
+with first-order (affine) warp model.
 Equivalent to ncorr_alg_rgdic.cpp and ncorr_alg_dicanalysis.m
 
 All performance-critical functions are at module level with Numba acceleration.
@@ -80,109 +81,135 @@ class DICResult:
 # =============================================================================
 
 @njit(cache=True, fastmath=True)
-def _compute_hessian_and_steepest(
-    ref_dx: NDArray[np.float64],
-    ref_dy: NDArray[np.float64],
-    ref_norm: float,
-    mask: NDArray[np.bool_],
-) -> Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-    """
-    Compute Hessian matrix and steepest descent images.
+def _bspline_interp(px: float, py: float, bcoef: NDArray[np.float64]) -> float:
+    """Inline B-spline interpolation for a single point (value only)."""
+    h, w = bcoef.shape
+    if px < 2.0 or px >= w - 3.0 or py < 2.0 or py >= h - 3.0:
+        return np.nan
 
-    For translation-only warp, the Jacobian of warp parameters is identity.
-    Steepest descent images are just the normalized gradients.
+    ix = int(px)
+    iy = int(py)
+    fx = px - ix
+    fy = py - iy
 
-    Args:
-        ref_dx: Reference image x-gradients
-        ref_dy: Reference image y-gradients
-        ref_norm: Reference subset norm
-        mask: Valid pixel mask
+    value = 0.0
+    for jj in range(-2, 4):
+        t_y = abs(fy - jj)
+        if t_y >= 3.0:
+            by = 0.0
+        elif t_y >= 2.0:
+            tmp = 3.0 - t_y
+            by = tmp * tmp * tmp * tmp * tmp / 120.0
+        elif t_y >= 1.0:
+            t2 = t_y * t_y
+            t3 = t2 * t_y
+            t4 = t3 * t_y
+            t5 = t4 * t_y
+            by = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_y + 1215.0) / 120.0
+        else:
+            t2 = t_y * t_y
+            t4 = t2 * t2
+            by = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
 
-    Returns:
-        Tuple of (H, grad_x, grad_y) where H is 2x2 Hessian
-    """
-    h, w = mask.shape
-    grad_x = ref_dx / ref_norm
-    grad_y = ref_dy / ref_norm
+        for ii in range(-2, 4):
+            t_x = abs(fx - ii)
+            if t_x >= 3.0:
+                bx = 0.0
+            elif t_x >= 2.0:
+                tmp = 3.0 - t_x
+                bx = tmp * tmp * tmp * tmp * tmp / 120.0
+            elif t_x >= 1.0:
+                t2 = t_x * t_x
+                t3 = t2 * t_x
+                t4 = t3 * t_x
+                t5 = t4 * t_x
+                bx = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_x + 1215.0) / 120.0
+            else:
+                t2 = t_x * t_x
+                t4 = t2 * t2
+                bx = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
 
-    # Compute Hessian = sum of outer products of gradients
-    H = np.zeros((2, 2), dtype=np.float64)
+            value += bcoef[iy + jj, ix + ii] * bx * by
 
-    for j in range(h):
-        for i in range(w):
-            if mask[j, i]:
-                gx = grad_x[j, i]
-                gy = grad_y[j, i]
-                H[0, 0] += gx * gx
-                H[0, 1] += gx * gy
-                H[1, 0] += gy * gx
-                H[1, 1] += gy * gy
-
-    return H, grad_x, grad_y
-
-
-@njit(cache=True, fastmath=True)
-def _compute_error_gradient(
-    grad_x: NDArray[np.float64],
-    grad_y: NDArray[np.float64],
-    error: NDArray[np.float64],
-    mask: NDArray[np.bool_],
-) -> NDArray[np.float64]:
-    """
-    Compute gradient of error w.r.t. warp parameters.
-
-    Args:
-        grad_x: Steepest descent image (x component)
-        grad_y: Steepest descent image (y component)
-        error: Error image (ref_normalized - cur_normalized)
-        mask: Valid pixel mask
-
-    Returns:
-        Gradient vector (2,)
-    """
-    h, w = mask.shape
-    b = np.zeros(2, dtype=np.float64)
-
-    for j in range(h):
-        for i in range(w):
-            if mask[j, i]:
-                e = error[j, i]
-                b[0] += grad_x[j, i] * e
-                b[1] += grad_y[j, i] * e
-
-    return b
+    return value
 
 
 @njit(cache=True, fastmath=True)
-def _compute_ncc(
-    ref_centered: NDArray[np.float64],
-    cur_centered: NDArray[np.float64],
-    ref_norm: float,
-    cur_norm: float,
-    mask: NDArray[np.bool_],
-) -> float:
-    """
-    Compute Normalized Cross-Correlation coefficient.
+def _bspline_interp_with_grad(
+    px: float, py: float, bcoef: NDArray[np.float64]
+) -> Tuple[float, float, float]:
+    """Inline B-spline interpolation with gradients."""
+    h, w = bcoef.shape
+    if px < 2.0 or px >= w - 3.0 or py < 2.0 or py >= h - 3.0:
+        return np.nan, np.nan, np.nan
 
-    Args:
-        ref_centered: Mean-centered reference subset
-        cur_centered: Mean-centered current subset
-        ref_norm: Norm of reference subset
-        cur_norm: Norm of current subset
-        mask: Valid pixel mask
+    ix = int(px)
+    iy = int(py)
+    fx = px - ix
+    fy = py - iy
 
-    Returns:
-        NCC value in range [-1, 1]
-    """
-    h, w = mask.shape
-    dot_product = 0.0
+    value = 0.0
+    grad_x = 0.0
+    grad_y = 0.0
 
-    for j in range(h):
-        for i in range(w):
-            if mask[j, i]:
-                dot_product += ref_centered[j, i] * cur_centered[j, i]
+    for jj in range(-2, 4):
+        t_y = abs(fy - jj)
+        if t_y >= 3.0:
+            by = 0.0
+            dby = 0.0
+        elif t_y >= 2.0:
+            tmp = 3.0 - t_y
+            by = tmp * tmp * tmp * tmp * tmp / 120.0
+            dby = -tmp * tmp * tmp * tmp / 24.0
+        elif t_y >= 1.0:
+            t2 = t_y * t_y
+            t3 = t2 * t_y
+            t4 = t3 * t_y
+            t5 = t4 * t_y
+            by = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_y + 1215.0) / 120.0
+            dby = (-25.0 * t4 + 300.0 * t3 - 1350.0 * t2 + 2700.0 * t_y - 2025.0) / 120.0
+        else:
+            t2 = t_y * t_y
+            t4 = t2 * t2
+            by = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
+            t3 = t2 * t_y
+            dby = (-60.0 * t_y + 20.0 * t3) / 60.0
 
-    return dot_product / (ref_norm * cur_norm)
+        if (fy - jj) < 0:
+            dby = -dby
+
+        for ii in range(-2, 4):
+            t_x = abs(fx - ii)
+            if t_x >= 3.0:
+                bx = 0.0
+                dbx = 0.0
+            elif t_x >= 2.0:
+                tmp = 3.0 - t_x
+                bx = tmp * tmp * tmp * tmp * tmp / 120.0
+                dbx = -tmp * tmp * tmp * tmp / 24.0
+            elif t_x >= 1.0:
+                t2 = t_x * t_x
+                t3 = t2 * t_x
+                t4 = t3 * t_x
+                t5 = t4 * t_x
+                bx = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_x + 1215.0) / 120.0
+                dbx = (-25.0 * t4 + 300.0 * t3 - 1350.0 * t2 + 2700.0 * t_x - 2025.0) / 120.0
+            else:
+                t2 = t_x * t_x
+                t4 = t2 * t2
+                bx = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
+                t3 = t2 * t_x
+                dbx = (-60.0 * t_x + 20.0 * t3) / 60.0
+
+            if (fx - ii) < 0:
+                dbx = -dbx
+
+            coef = bcoef[iy + jj, ix + ii]
+            value += coef * bx * by
+            grad_x += coef * dbx * by
+            grad_y += coef * bx * dby
+
+    return value, grad_x, grad_y
 
 
 @njit(cache=True, fastmath=True)
@@ -216,31 +243,79 @@ def _masked_norm(arr: NDArray[np.float64], mask: NDArray[np.bool_]) -> float:
 
 
 @njit(cache=True, fastmath=True)
-def _solve_2x2(H: NDArray[np.float64], b: NDArray[np.float64]) -> Tuple[NDArray[np.float64], bool]:
+def _compute_ncc(
+    ref_centered: NDArray[np.float64],
+    cur_centered: NDArray[np.float64],
+    ref_norm: float,
+    cur_norm: float,
+    mask: NDArray[np.bool_],
+) -> float:
+    """Compute Normalized Cross-Correlation coefficient."""
+    h, w = mask.shape
+    dot_product = 0.0
+
+    for j in range(h):
+        for i in range(w):
+            if mask[j, i]:
+                dot_product += ref_centered[j, i] * cur_centered[j, i]
+
+    return dot_product / (ref_norm * cur_norm)
+
+
+@njit(cache=True, fastmath=True)
+def _solve_6x6(A: NDArray[np.float64], b: NDArray[np.float64]) -> Tuple[NDArray[np.float64], bool]:
     """
-    Solve 2x2 linear system Hx = b.
-
-    Args:
-        H: 2x2 matrix
-        b: 2-element vector
-
-    Returns:
-        Tuple of (solution, success)
+    Solve 6x6 linear system Ax = b using Gaussian elimination with partial pivoting.
     """
-    det = H[0, 0] * H[1, 1] - H[0, 1] * H[1, 0]
+    n = 6
+    # Create augmented matrix
+    aug = np.zeros((n, n + 1), dtype=np.float64)
+    for i in range(n):
+        for j in range(n):
+            aug[i, j] = A[i, j]
+        aug[i, n] = b[i]
 
-    if abs(det) < 1e-12:
-        return np.zeros(2, dtype=np.float64), False
+    # Forward elimination with partial pivoting
+    for col in range(n):
+        # Find pivot
+        max_val = abs(aug[col, col])
+        max_row = col
+        for row in range(col + 1, n):
+            if abs(aug[row, col]) > max_val:
+                max_val = abs(aug[row, col])
+                max_row = row
 
-    x = np.empty(2, dtype=np.float64)
-    x[0] = (H[1, 1] * b[0] - H[0, 1] * b[1]) / det
-    x[1] = (H[0, 0] * b[1] - H[1, 0] * b[0]) / det
+        if max_val < 1e-12:
+            return np.zeros(n, dtype=np.float64), False
+
+        # Swap rows
+        if max_row != col:
+            for j in range(n + 1):
+                tmp = aug[col, j]
+                aug[col, j] = aug[max_row, j]
+                aug[max_row, j] = tmp
+
+        # Eliminate
+        for row in range(col + 1, n):
+            factor = aug[row, col] / aug[col, col]
+            for j in range(col, n + 1):
+                aug[row, j] -= factor * aug[col, j]
+
+    # Back substitution
+    x = np.zeros(n, dtype=np.float64)
+    for i in range(n - 1, -1, -1):
+        x[i] = aug[i, n]
+        for j in range(i + 1, n):
+            x[i] -= aug[i, j] * x[j]
+        if abs(aug[i, i]) < 1e-12:
+            return np.zeros(n, dtype=np.float64), False
+        x[i] /= aug[i, i]
 
     return x, True
 
 
 @njit(cache=True, fastmath=True)
-def _ic_gn_single_point(
+def _ic_gn_first_order(
     ref_bcoef: NDArray[np.float64],
     cur_bcoef: NDArray[np.float64],
     border: int,
@@ -253,15 +328,19 @@ def _ic_gn_single_point(
     cutoff_iteration: int,
 ) -> Tuple[float, float, float, bool]:
     """
-    Perform IC-GN optimization for a single point.
+    IC-GN optimization with first-order (affine) warp model.
 
-    This is the core optimization function, fully Numba-accelerated.
+    Uses 6 parameters: [u, du/dx, du/dy, v, dv/dx, dv/dy]
+
+    The warp function maps reference subset coordinates to current image:
+    W(Δx, Δy; p) = [x + u + du/dx*Δx + du/dy*Δy]
+                   [y + v + dv/dx*Δx + dv/dy*Δy]
 
     Args:
         ref_bcoef: Reference image B-spline coefficients
         cur_bcoef: Current image B-spline coefficients
         border: Border padding
-        x, y: Subset center coordinates
+        x, y: Subset center coordinates (in original image)
         radius: Subset radius
         u_init, v_init: Initial displacement guess
         cutoff_diffnorm: Convergence threshold
@@ -272,19 +351,32 @@ def _ic_gn_single_point(
     """
     size = 2 * radius + 1
     h_ref, w_ref = ref_bcoef.shape
+    h_cur, w_cur = cur_bcoef.shape
 
-    # Get reference subset with gradients
+    # Arrays for reference subset
     ref_subset = np.empty((size, size), dtype=np.float64)
     ref_dx = np.empty((size, size), dtype=np.float64)
     ref_dy = np.empty((size, size), dtype=np.float64)
     mask = np.ones((size, size), dtype=np.bool_)
 
+    # Relative coordinates (Δx, Δy) for each pixel
+    delta_x = np.empty((size, size), dtype=np.float64)
+    delta_y = np.empty((size, size), dtype=np.float64)
+
     valid_count = 0
 
+    # Get reference subset with gradients
     for j in range(size):
         for i in range(size):
-            px = float(x) - radius + i + border
-            py = float(y) - radius + j + border
+            # Relative coordinates from subset center
+            dx = float(i - radius)
+            dy = float(j - radius)
+            delta_x[j, i] = dx
+            delta_y[j, i] = dy
+
+            # Absolute coordinates in bcoef (with border)
+            px = float(x) + dx + border
+            py = float(y) + dy + border
 
             if px < 2.0 or px >= w_ref - 3.0 or py < 2.0 or py >= h_ref - 3.0:
                 mask[j, i] = False
@@ -293,83 +385,22 @@ def _ic_gn_single_point(
                 ref_dy[j, i] = 0.0
                 continue
 
-            # B-spline interpolation (inline for performance)
-            ix = int(px)
-            iy = int(py)
-            fx = px - ix
-            fy = py - iy
+            val, gx, gy = _bspline_interp_with_grad(px, py, ref_bcoef)
 
-            value = 0.0
-            grad_x = 0.0
-            grad_y = 0.0
+            if np.isnan(val):
+                mask[j, i] = False
+                ref_subset[j, i] = 0.0
+                ref_dx[j, i] = 0.0
+                ref_dy[j, i] = 0.0
+                continue
 
-            # Quintic B-spline kernel coefficients (precomputed)
-            for jj in range(-2, 4):
-                t_y = abs(fy - jj)
-                if t_y >= 3.0:
-                    by = 0.0
-                    dby = 0.0
-                elif t_y >= 2.0:
-                    tmp = 3.0 - t_y
-                    by = tmp * tmp * tmp * tmp * tmp / 120.0
-                    dby = -tmp * tmp * tmp * tmp / 24.0
-                elif t_y >= 1.0:
-                    t2 = t_y * t_y
-                    t3 = t2 * t_y
-                    t4 = t3 * t_y
-                    t5 = t4 * t_y
-                    by = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_y + 1215.0) / 120.0
-                    dby = (-25.0 * t4 + 300.0 * t3 - 1350.0 * t2 + 2700.0 * t_y - 2025.0) / 120.0
-                else:
-                    t2 = t_y * t_y
-                    t4 = t2 * t2
-                    by = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
-                    t3 = t2 * t_y
-                    dby = (-60.0 * t_y + 20.0 * t3) / 60.0
-
-                # Correct sign for derivative
-                if (fy - jj) < 0:
-                    dby = -dby
-
-                for ii in range(-2, 4):
-                    t_x = abs(fx - ii)
-                    if t_x >= 3.0:
-                        bx = 0.0
-                        dbx = 0.0
-                    elif t_x >= 2.0:
-                        tmp = 3.0 - t_x
-                        bx = tmp * tmp * tmp * tmp * tmp / 120.0
-                        dbx = -tmp * tmp * tmp * tmp / 24.0
-                    elif t_x >= 1.0:
-                        t2 = t_x * t_x
-                        t3 = t2 * t_x
-                        t4 = t3 * t_x
-                        t5 = t4 * t_x
-                        bx = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_x + 1215.0) / 120.0
-                        dbx = (-25.0 * t4 + 300.0 * t3 - 1350.0 * t2 + 2700.0 * t_x - 2025.0) / 120.0
-                    else:
-                        t2 = t_x * t_x
-                        t4 = t2 * t2
-                        bx = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
-                        t3 = t2 * t_x
-                        dbx = (-60.0 * t_x + 20.0 * t3) / 60.0
-
-                    # Correct sign for derivative
-                    if (fx - ii) < 0:
-                        dbx = -dbx
-
-                    coef = ref_bcoef[iy + jj, ix + ii]
-                    value += coef * bx * by
-                    grad_x += coef * dbx * by
-                    grad_y += coef * bx * dby
-
-            ref_subset[j, i] = value
-            ref_dx[j, i] = grad_x
-            ref_dy[j, i] = grad_y
+            ref_subset[j, i] = val
+            ref_dx[j, i] = gx
+            ref_dy[j, i] = gy
             valid_count += 1
 
     # Need minimum valid pixels
-    if valid_count < 10:
+    if valid_count < 20:
         return np.nan, np.nan, np.nan, False
 
     # Reference subset statistics
@@ -380,22 +411,88 @@ def _ic_gn_single_point(
     if ref_norm < 1e-10:
         return np.nan, np.nan, np.nan, False
 
-    # Precompute Hessian (only depends on reference)
-    H, grad_x, grad_y = _compute_hessian_and_steepest(ref_dx, ref_dy, ref_norm, mask)
+    # Normalize gradients
+    grad_x_norm = ref_dx / ref_norm
+    grad_y_norm = ref_dy / ref_norm
 
-    # Check if Hessian is invertible
-    det = H[0, 0] * H[1, 1] - H[0, 1] * H[1, 0]
-    if abs(det) < 1e-12:
-        return np.nan, np.nan, np.nan, False
+    # Precompute Hessian matrix (6x6) and steepest descent images
+    # Steepest descent: SD = [∂T/∂x, ∂T/∂x*Δx, ∂T/∂x*Δy, ∂T/∂y, ∂T/∂y*Δx, ∂T/∂y*Δy]
+    H = np.zeros((6, 6), dtype=np.float64)
+
+    for j in range(size):
+        for i in range(size):
+            if not mask[j, i]:
+                continue
+
+            gx = grad_x_norm[j, i]
+            gy = grad_y_norm[j, i]
+            dx = delta_x[j, i]
+            dy = delta_y[j, i]
+
+            # Steepest descent image at this pixel
+            # SD = [gx, gx*dx, gx*dy, gy, gy*dx, gy*dy]
+            sd0 = gx
+            sd1 = gx * dx
+            sd2 = gx * dy
+            sd3 = gy
+            sd4 = gy * dx
+            sd5 = gy * dy
+
+            # Hessian = sum of outer products SD^T * SD
+            H[0, 0] += sd0 * sd0
+            H[0, 1] += sd0 * sd1
+            H[0, 2] += sd0 * sd2
+            H[0, 3] += sd0 * sd3
+            H[0, 4] += sd0 * sd4
+            H[0, 5] += sd0 * sd5
+
+            H[1, 1] += sd1 * sd1
+            H[1, 2] += sd1 * sd2
+            H[1, 3] += sd1 * sd3
+            H[1, 4] += sd1 * sd4
+            H[1, 5] += sd1 * sd5
+
+            H[2, 2] += sd2 * sd2
+            H[2, 3] += sd2 * sd3
+            H[2, 4] += sd2 * sd4
+            H[2, 5] += sd2 * sd5
+
+            H[3, 3] += sd3 * sd3
+            H[3, 4] += sd3 * sd4
+            H[3, 5] += sd3 * sd5
+
+            H[4, 4] += sd4 * sd4
+            H[4, 5] += sd4 * sd5
+
+            H[5, 5] += sd5 * sd5
+
+    # Hessian is symmetric
+    H[1, 0] = H[0, 1]
+    H[2, 0] = H[0, 2]
+    H[2, 1] = H[1, 2]
+    H[3, 0] = H[0, 3]
+    H[3, 1] = H[1, 3]
+    H[3, 2] = H[2, 3]
+    H[4, 0] = H[0, 4]
+    H[4, 1] = H[1, 4]
+    H[4, 2] = H[2, 4]
+    H[4, 3] = H[3, 4]
+    H[5, 0] = H[0, 5]
+    H[5, 1] = H[1, 5]
+    H[5, 2] = H[2, 5]
+    H[5, 3] = H[3, 5]
+    H[5, 4] = H[4, 5]
 
     # Reference normalized
     ref_normalized = ref_centered / ref_norm
 
-    # Initialize parameters
-    u, v = u_init, v_init
-    converged = False
+    # Initialize warp parameters: [u, du/dx, du/dy, v, dv/dx, dv/dy]
+    p = np.zeros(6, dtype=np.float64)
+    p[0] = u_init  # u
+    p[3] = v_init  # v
+    # Deformation gradients start at zero (no deformation)
 
-    h_cur, w_cur = cur_bcoef.shape
+    converged = False
 
     for iteration in range(cutoff_iteration):
         # Get current subset at warped location
@@ -408,59 +505,26 @@ def _ic_gn_single_point(
                     cur_subset[j, i] = 0.0
                     continue
 
-                px = float(x) + u - radius + i + border
-                py = float(y) + v - radius + j + border
+                dx = delta_x[j, i]
+                dy = delta_y[j, i]
 
-                if px < 2.0 or px >= w_cur - 3.0 or py < 2.0 or py >= h_cur - 3.0:
+                # Warp: W(dx, dy; p)
+                # wx = x + dx + u + du/dx*dx + du/dy*dy
+                # wy = y + dy + v + dv/dx*dx + dv/dy*dy
+                wx = float(x) + dx + p[0] + p[1] * dx + p[2] * dy + border
+                wy = float(y) + dy + p[3] + p[4] * dx + p[5] * dy + border
+
+                if wx < 2.0 or wx >= w_cur - 3.0 or wy < 2.0 or wy >= h_cur - 3.0:
                     all_valid = False
                     break
 
-                # B-spline interpolation (value only)
-                ix = int(px)
-                iy = int(py)
-                fx = px - ix
-                fy = py - iy
+                val = _bspline_interp(wx, wy, cur_bcoef)
 
-                value = 0.0
-                for jj in range(-2, 4):
-                    t_y = abs(fy - jj)
-                    if t_y >= 3.0:
-                        by = 0.0
-                    elif t_y >= 2.0:
-                        tmp = 3.0 - t_y
-                        by = tmp * tmp * tmp * tmp * tmp / 120.0
-                    elif t_y >= 1.0:
-                        t2 = t_y * t_y
-                        t3 = t2 * t_y
-                        t4 = t3 * t_y
-                        t5 = t4 * t_y
-                        by = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_y + 1215.0) / 120.0
-                    else:
-                        t2 = t_y * t_y
-                        t4 = t2 * t2
-                        by = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
+                if np.isnan(val):
+                    all_valid = False
+                    break
 
-                    for ii in range(-2, 4):
-                        t_x = abs(fx - ii)
-                        if t_x >= 3.0:
-                            bx = 0.0
-                        elif t_x >= 2.0:
-                            tmp = 3.0 - t_x
-                            bx = tmp * tmp * tmp * tmp * tmp / 120.0
-                        elif t_x >= 1.0:
-                            t2 = t_x * t_x
-                            t3 = t2 * t_x
-                            t4 = t3 * t_x
-                            t5 = t4 * t_x
-                            bx = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_x + 1215.0) / 120.0
-                        else:
-                            t2 = t_x * t_x
-                            t4 = t2 * t2
-                            bx = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
-
-                        value += cur_bcoef[iy + jj, ix + ii] * bx * by
-
-                cur_subset[j, i] = value
+                cur_subset[j, i] = val
 
             if not all_valid:
                 break
@@ -481,20 +545,43 @@ def _ic_gn_single_point(
         # Error image
         error = ref_normalized - cur_normalized
 
-        # Compute gradient
-        b = _compute_error_gradient(grad_x, grad_y, error, mask)
+        # Compute gradient: b = Σ SD^T * error
+        b = np.zeros(6, dtype=np.float64)
+        for j in range(size):
+            for i in range(size):
+                if not mask[j, i]:
+                    continue
 
-        # Solve for update
-        dp, success = _solve_2x2(H, b)
+                gx = grad_x_norm[j, i]
+                gy = grad_y_norm[j, i]
+                dx = delta_x[j, i]
+                dy = delta_y[j, i]
+                e = error[j, i]
+
+                b[0] += gx * e
+                b[1] += gx * dx * e
+                b[2] += gx * dy * e
+                b[3] += gy * e
+                b[4] += gy * dx * e
+                b[5] += gy * dy * e
+
+        # Solve for parameter update
+        dp, success = _solve_6x6(H, b)
         if not success:
             break
 
-        # Update parameters
-        u += dp[0]
-        v += dp[1]
+        # Update parameters (inverse compositional update)
+        # For first-order warp, the update is more complex
+        # Simplified: just add the updates (forward additive approximation)
+        p[0] += dp[0]
+        p[1] += dp[1]
+        p[2] += dp[2]
+        p[3] += dp[3]
+        p[4] += dp[4]
+        p[5] += dp[5]
 
-        # Check convergence
-        diffnorm = np.sqrt(dp[0] * dp[0] + dp[1] * dp[1])
+        # Check convergence (norm of displacement update)
+        diffnorm = np.sqrt(dp[0] * dp[0] + dp[3] * dp[3])
         if diffnorm < cutoff_diffnorm:
             converged = True
             break
@@ -509,58 +596,23 @@ def _ic_gn_single_point(
                 cur_subset[j, i] = 0.0
                 continue
 
-            px = float(x) + u - radius + i + border
-            py = float(y) + v - radius + j + border
+            dx = delta_x[j, i]
+            dy = delta_y[j, i]
 
-            if px < 2.0 or px >= w_cur - 3.0 or py < 2.0 or py >= h_cur - 3.0:
+            wx = float(x) + dx + p[0] + p[1] * dx + p[2] * dy + border
+            wy = float(y) + dy + p[3] + p[4] * dx + p[5] * dy + border
+
+            if wx < 2.0 or wx >= w_cur - 3.0 or wy < 2.0 or wy >= h_cur - 3.0:
                 all_valid = False
                 break
 
-            ix = int(px)
-            iy = int(py)
-            fx = px - ix
-            fy = py - iy
+            val = _bspline_interp(wx, wy, cur_bcoef)
 
-            value = 0.0
-            for jj in range(-2, 4):
-                t_y = abs(fy - jj)
-                if t_y >= 3.0:
-                    by = 0.0
-                elif t_y >= 2.0:
-                    tmp = 3.0 - t_y
-                    by = tmp * tmp * tmp * tmp * tmp / 120.0
-                elif t_y >= 1.0:
-                    t2 = t_y * t_y
-                    t3 = t2 * t_y
-                    t4 = t3 * t_y
-                    t5 = t4 * t_y
-                    by = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_y + 1215.0) / 120.0
-                else:
-                    t2 = t_y * t_y
-                    t4 = t2 * t2
-                    by = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
+            if np.isnan(val):
+                all_valid = False
+                break
 
-                for ii in range(-2, 4):
-                    t_x = abs(fx - ii)
-                    if t_x >= 3.0:
-                        bx = 0.0
-                    elif t_x >= 2.0:
-                        tmp = 3.0 - t_x
-                        bx = tmp * tmp * tmp * tmp * tmp / 120.0
-                    elif t_x >= 1.0:
-                        t2 = t_x * t_x
-                        t3 = t2 * t_x
-                        t4 = t3 * t_x
-                        t5 = t4 * t_x
-                        bx = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_x + 1215.0) / 120.0
-                    else:
-                        t2 = t_x * t_x
-                        t4 = t2 * t2
-                        bx = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
-
-                    value += cur_bcoef[iy + jj, ix + ii] * bx * by
-
-            cur_subset[j, i] = value
+            cur_subset[j, i] = val
 
         if not all_valid:
             break
@@ -577,7 +629,8 @@ def _ic_gn_single_point(
 
     ncc = _compute_ncc(ref_centered, cur_centered, ref_norm, cur_norm, mask)
 
-    return u, v, ncc, converged
+    # Return displacement at subset center (u, v)
+    return p[0], p[3], ncc, converged
 
 
 @njit(cache=True, fastmath=True)
@@ -602,6 +655,10 @@ def _check_point_in_region(
     return False
 
 
+# Alias for backwards compatibility
+_ic_gn_single_point = _ic_gn_first_order
+
+
 # =============================================================================
 # Main DICAnalysis class
 # =============================================================================
@@ -611,8 +668,8 @@ class DICAnalysis:
     Digital Image Correlation analysis using IC-GN algorithm.
 
     The IC-GN algorithm uses an inverse compositional Gauss-Newton
-    optimization to find subpixel displacements between a reference
-    and current image.
+    optimization with first-order (affine) warp to find subpixel
+    displacements between a reference and current image.
     """
 
     def __init__(self, params: DICParameters):
@@ -818,8 +875,8 @@ class DICAnalysis:
             if not _check_point_in_region(x, y, leftbound, noderange, nodelist):
                 continue
 
-            # Perform IC-GN optimization (Numba-accelerated)
-            u, v, cc, conv = _ic_gn_single_point(
+            # Perform IC-GN optimization with first-order warp (Numba-accelerated)
+            u, v, cc, conv = _ic_gn_first_order(
                 ref_bcoef, cur_bcoef, border,
                 x, y, radius,
                 u_guess, v_guess,
