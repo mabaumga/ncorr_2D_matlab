@@ -1291,12 +1291,16 @@ class DICAnalysis:
         """
         results = []
         current_seeds = seeds
+        prev_result = None  # Previous result for initialization
 
         for i, cur_img in enumerate(cur_imgs):
             self._report_progress(i / len(cur_imgs), f"Analyzing image {i+1}/{len(cur_imgs)}")
 
-            result = self._analyze_single(ref_img, cur_img, roi, current_seeds)
+            result = self._analyze_single(ref_img, cur_img, roi, current_seeds, prev_result)
             results.append(result)
+
+            # Use this result as initial guess for next image
+            prev_result = result
 
             # Update seeds for next image if step analysis enabled
             if self.params.step_analysis.enabled:
@@ -1310,9 +1314,17 @@ class DICAnalysis:
         cur_img: NcorrImage,
         roi: NcorrROI,
         seeds: List[SeedInfo],
+        prev_result: Optional[DICResult] = None,
     ) -> DICResult:
         """
         Analyze single image pair.
+
+        Args:
+            ref_img: Reference image
+            cur_img: Current image
+            roi: Region of interest
+            seeds: Seed points
+            prev_result: Previous result to use as initial guess (for sequences)
         """
         # Get image data
         ref_bcoef = ref_img.get_bcoef()
@@ -1331,6 +1343,11 @@ class DICAnalysis:
         roi_plot = np.zeros((out_h, out_w), dtype=np.bool_)
         converged = np.zeros((out_h, out_w), dtype=np.bool_)
         iterations = np.zeros((out_h, out_w), dtype=np.int32)
+
+        # Get previous displacement fields for initialization
+        prev_u = prev_result.u if prev_result is not None else None
+        prev_v = prev_result.v if prev_result is not None else None
+        prev_roi = prev_result.roi if prev_result is not None else None
 
         # Process each seed/region
         updated_seeds = []
@@ -1360,7 +1377,8 @@ class DICAnalysis:
                 region, seed,
                 u_plot, v_plot, corrcoef_plot, roi_plot, converged, iterations,
                 step,
-                estimated_points
+                estimated_points,
+                prev_u, prev_v, prev_roi
             )
             total_points += points_processed
 
@@ -1404,16 +1422,22 @@ class DICAnalysis:
         iterations: NDArray[np.int32],
         step: int,
         estimated_points: int = 0,
+        prev_u: Optional[NDArray[np.float64]] = None,
+        prev_v: Optional[NDArray[np.float64]] = None,
+        prev_roi: Optional[NDArray[np.bool_]] = None,
     ) -> int:
         """
         Process a single region using flood-fill from seed.
 
-        Uses 2-parameter translation model which is more robust for
-        large displacements with small strain variations.
+        Uses 6-parameter affine model with local NCC search for robust convergence.
+        If prev_u/prev_v are provided (from previous frame), uses them as initial guesses.
         """
         radius = self.params.radius
         cutoff_diffnorm = self.params.cutoff_diffnorm
         cutoff_iteration = self.params.cutoff_iteration
+
+        # Check if we have previous results to use as initial guesses
+        use_prev_result = (prev_u is not None and prev_v is not None and prev_roi is not None)
 
         # DEBUG: Print seed and parameters
         print(f"\n{'='*60}")
@@ -1422,8 +1446,7 @@ class DICAnalysis:
         print(f"  Seed displacement: u={seed.u:.4f}, v={seed.v:.4f}")
         print(f"  Radius: {radius}, Step: {step}")
         print(f"  Border: {border}")
-        print(f"  ref_bcoef shape: {ref_bcoef.shape}")
-        print(f"  cur_bcoef shape: {cur_bcoef.shape}")
+        print(f"  Using previous result: {use_prev_result}")
         print(f"  cutoff_diffnorm: {cutoff_diffnorm}, cutoff_iteration: {cutoff_iteration}")
 
         # DEBUG: Test IC-GN directly at seed point
@@ -1620,11 +1643,19 @@ class DICAnalysis:
                 if not _check_point_in_region(x, y, leftbound, noderange, nodelist):
                     continue
 
+                # Use previous result as initial guess if available
+                if use_prev_result and prev_roi[oy, ox] and not np.isnan(prev_u[oy, ox]):
+                    u_init_val = prev_u[oy, ox]
+                    v_init_val = prev_v[oy, ox]
+                else:
+                    u_init_val = u_guess
+                    v_init_val = v_guess
+
                 # Add to batch
                 batch_points_x.append(x)
                 batch_points_y.append(y)
-                batch_u_init.append(u_guess)
-                batch_v_init.append(v_guess)
+                batch_u_init.append(u_init_val)
+                batch_v_init.append(v_init_val)
                 batch_ox.append(ox)
                 batch_oy.append(oy)
 
