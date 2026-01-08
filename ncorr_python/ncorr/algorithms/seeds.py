@@ -3,8 +3,7 @@ Seed calculation and placement algorithms.
 
 Equivalent to ncorr_alg_calcseeds.cpp and ncorr_gui_seedanalysis.m
 
-Implements coarse-to-fine NCC search with FFT acceleration for robust
-initial displacement estimation.
+Implements FFT-accelerated NCC search for robust initial displacement estimation.
 """
 
 from __future__ import annotations
@@ -14,7 +13,6 @@ from typing import List, Optional, Tuple, Callable
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.ndimage import zoom
 from scipy.signal import fftconvolve
 
 from .dic import SeedInfo
@@ -40,13 +38,8 @@ class SeedCalculator:
     """
     Calculate initial seed positions and displacements.
 
-    Uses multi-scale normalized cross-correlation (NCC) for coarse search
+    Uses FFT-accelerated normalized cross-correlation (NCC) for initial search
     followed by subpixel refinement using IC-GN optimization.
-
-    The coarse-to-fine approach:
-    1. Downsample images by factor 4 and search with large radius
-    2. Refine at original resolution with smaller search radius
-    3. Subpixel refinement using IC-GN
     """
 
     def __init__(self, params: DICParameters):
@@ -73,19 +66,18 @@ class SeedCalculator:
         ref_img: NcorrImage,
         cur_img: NcorrImage,
         roi: NcorrROI,
-        search_radius: int = 100,
+        search_radius: int = 150,
     ) -> List[SeedInfo]:
         """
         Calculate seed points for each region.
 
-        Uses coarse-to-fine multi-scale NCC search for robust displacement
-        estimation even for large displacements.
+        Uses direct FFT-NCC search for robust displacement estimation.
 
         Args:
             ref_img: Reference image
             cur_img: Current (first) image
             roi: Region of interest
-            search_radius: Maximum search radius for NCC (default 100 pixels)
+            search_radius: Maximum search radius for NCC (default 150 pixels)
 
         Returns:
             List of SeedInfo for each region
@@ -95,6 +87,14 @@ class SeedCalculator:
         # Get grayscale images
         ref_gs = ref_img.get_gs()
         cur_gs = cur_img.get_gs()
+
+        print(f"\n{'='*60}")
+        print("Seed Calculation Debug")
+        print(f"{'='*60}")
+        print(f"Reference image shape: {ref_gs.shape}")
+        print(f"Current image shape: {cur_gs.shape}")
+        print(f"Search radius: {search_radius}")
+        print(f"Subset radius: {self.params.radius}")
 
         for region_idx, region in enumerate(roi.regions):
             self._report_progress(
@@ -111,26 +111,24 @@ class SeedCalculator:
 
             # Find center of region
             center_x, center_y = self._find_region_center(region)
+            print(f"\nRegion {region_idx + 1}:")
+            print(f"  Center: ({center_x}, {center_y})")
 
-            # Perform coarse-to-fine NCC search
-            result = self._coarse_to_fine_ncc_search(
+            # Perform direct FFT-NCC search (no coarse-to-fine)
+            result = self._fft_ncc_search(
                 ref_gs, cur_gs, center_x, center_y,
                 self.params.radius, search_radius
             )
 
             if result is None:
-                # Try direct NCC with larger search radius
-                result = self._fft_ncc_search(
-                    ref_gs, cur_gs, center_x, center_y,
-                    self.params.radius, search_radius
-                )
-
-            if result is None:
+                print(f"  FFT-NCC search FAILED")
                 seeds.append(SeedInfo(
                     x=center_x, y=center_y, u=0, v=0,
                     region_idx=region_idx, valid=False
                 ))
                 continue
+
+            print(f"  FFT-NCC result: u={result.u:.2f}, v={result.v:.2f}, CC={result.correlation:.4f}")
 
             # Subpixel refinement
             refined = self._subpixel_refine(
@@ -139,9 +137,16 @@ class SeedCalculator:
                 result.u, result.v
             )
 
-            final_u = refined.u if refined else result.u
-            final_v = refined.v if refined else result.v
-            final_cc = refined.correlation if refined else result.correlation
+            if refined:
+                final_u = refined.u
+                final_v = refined.v
+                final_cc = refined.correlation
+                print(f"  Subpixel refined: u={final_u:.2f}, v={final_v:.2f}, CC={final_cc:.4f}")
+            else:
+                final_u = result.u
+                final_v = result.v
+                final_cc = result.correlation
+                print(f"  Subpixel refinement failed, using NCC result")
 
             seeds.append(SeedInfo(
                 x=center_x,
@@ -152,10 +157,9 @@ class SeedCalculator:
                 valid=final_cc > 0.5
             ))
 
-            # Print seed info for debugging
-            print(f"Seed {region_idx + 1}: x={center_x}, y={center_y}, "
-                  f"u={final_u:.2f}, v={final_v:.2f}, CC={final_cc:.4f}")
+            print(f"  Final seed: u={final_u:.2f}, v={final_v:.2f}, CC={final_cc:.4f}, valid={final_cc > 0.5}")
 
+        print(f"{'='*60}\n")
         return seeds
 
     def _find_region_center(self, region) -> Tuple[int, int]:
@@ -178,98 +182,6 @@ class SeedCalculator:
 
         return center_x, center_y
 
-    def _coarse_to_fine_ncc_search(
-        self,
-        ref_gs: NDArray[np.float64],
-        cur_gs: NDArray[np.float64],
-        x: int,
-        y: int,
-        radius: int,
-        search_radius: int,
-    ) -> Optional[SeedSearchResult]:
-        """
-        Perform coarse-to-fine NCC search.
-
-        Uses image pyramid for efficient large-displacement search.
-
-        Args:
-            ref_gs: Reference grayscale image
-            cur_gs: Current grayscale image
-            x, y: Center point in reference
-            radius: Subset radius
-            search_radius: Maximum search radius
-
-        Returns:
-            SeedSearchResult or None if failed
-        """
-        h, w = ref_gs.shape
-
-        # Determine scale factors based on image size and search radius
-        # Only use coarse scales if the image is large enough
-        scales = []
-        if min(h, w) >= 400 and search_radius >= 50:
-            scales.append(4)
-        if min(h, w) >= 200 and search_radius >= 20:
-            scales.append(2)
-        scales.append(1)
-
-        u_est, v_est = 0.0, 0.0
-        result = None
-
-        for scale in scales:
-            if scale > 1:
-                # Downsample images
-                ref_scaled = zoom(ref_gs, 1.0 / scale, order=1)
-                cur_scaled = zoom(cur_gs, 1.0 / scale, order=1)
-
-                # Scale coordinates
-                x_scaled = x // scale
-                y_scaled = y // scale
-                radius_scaled = max(5, radius // scale)
-
-                # Larger search at coarse scales
-                search_scaled = max(10, search_radius // scale)
-            else:
-                ref_scaled = ref_gs
-                cur_scaled = cur_gs
-                x_scaled = x
-                y_scaled = y
-                radius_scaled = radius
-                # At finest scale, search around previous estimate if any
-                if len(scales) > 1 and result is not None:
-                    search_scaled = max(5, search_radius // 4)
-                else:
-                    search_scaled = search_radius
-
-            # Perform NCC search at this scale
-            result = self._fft_ncc_search(
-                ref_scaled, cur_scaled,
-                x_scaled, y_scaled,
-                radius_scaled, search_scaled,
-                u_offset=u_est / scale if scale > 1 else u_est,
-                v_offset=v_est / scale if scale > 1 else v_est,
-            )
-
-            if result is None:
-                if scale == scales[-1]:  # Only fail at finest scale
-                    return None
-                continue
-
-            # Update estimate (scale back to original resolution)
-            if scale > 1:
-                u_est = result.u * scale
-                v_est = result.v * scale
-            else:
-                u_est = result.u
-                v_est = result.v
-
-        return SeedSearchResult(
-            x=x, y=y,
-            u=u_est, v=v_est,
-            correlation=result.correlation if result else 0.0,
-            converged=True
-        )
-
     def _fft_ncc_search(
         self,
         ref_gs: NDArray[np.float64],
@@ -278,8 +190,6 @@ class SeedCalculator:
         y: int,
         radius: int,
         search_radius: int,
-        u_offset: float = 0.0,
-        v_offset: float = 0.0,
     ) -> Optional[SeedSearchResult]:
         """
         Perform FFT-accelerated normalized cross-correlation search.
@@ -290,7 +200,6 @@ class SeedCalculator:
             x, y: Center point in reference
             radius: Subset radius
             search_radius: Search radius
-            u_offset, v_offset: Offset to add to result (for multi-scale)
 
         Returns:
             SeedSearchResult or None if failed
@@ -306,44 +215,68 @@ class SeedCalculator:
         template = ref_gs[y1:y2, x1:x2].astype(np.float64)
 
         if template.size == 0 or template.shape[0] < 5 or template.shape[1] < 5:
+            print(f"    Template too small: {template.shape}")
             return None
 
         # Check template has enough contrast
-        if np.std(template) < 1e-10:
+        template_std = np.std(template)
+        if template_std < 1e-10:
+            print(f"    Template has no contrast: std={template_std}")
             return None
 
-        # Define search area in current image (accounting for expected displacement)
-        expected_u = int(u_offset)
-        expected_v = int(v_offset)
-
-        sy1 = max(0, y + expected_v - radius - search_radius)
-        sy2 = min(h, y + expected_v + radius + search_radius + 1)
-        sx1 = max(0, x + expected_u - radius - search_radius)
-        sx2 = min(w, x + expected_u + radius + search_radius + 1)
+        # Define search area in current image
+        # Search area should be large enough to cover expected displacement
+        sy1 = max(0, y - radius - search_radius)
+        sy2 = min(h, y + radius + search_radius + 1)
+        sx1 = max(0, x - radius - search_radius)
+        sx2 = min(w, x + radius + search_radius + 1)
 
         search_area = cur_gs[sy1:sy2, sx1:sx2].astype(np.float64)
 
         if search_area.shape[0] < template.shape[0] or search_area.shape[1] < template.shape[1]:
+            print(f"    Search area too small: {search_area.shape} < {template.shape}")
             return None
 
         # Compute NCC using FFT
         ncc_map = self._compute_ncc_fft(template, search_area)
 
         if ncc_map is None or ncc_map.size == 0:
+            print(f"    NCC computation failed")
             return None
 
         # Find best match
         best_idx = np.unravel_index(np.argmax(ncc_map), ncc_map.shape)
         best_ncc = ncc_map[best_idx]
+        best_dy, best_dx = best_idx
 
-        if best_ncc < 0.3:  # Lower threshold for coarse search
+        print(f"    NCC map shape: {ncc_map.shape}, max NCC: {best_ncc:.4f} at ({best_dx}, {best_dy})")
+
+        if best_ncc < 0.3:
+            print(f"    NCC too low: {best_ncc:.4f} < 0.3")
             return None
 
         # Calculate displacement
-        # The search area was shifted by expected displacement, so we need to account for that
-        best_dy, best_dx = best_idx
-        u = (sx1 + best_dx) - x1
-        v = (sy1 + best_dy) - y1
+        # Template was extracted from ref at [y1:y2, x1:x2]
+        # Search area was extracted from cur at [sy1:sy2, sx1:sx2]
+        # NCC best match at (best_dy, best_dx) in NCC map
+        # With 'valid' mode, this means template placed at (best_dx, best_dy) in search area
+
+        # Template center in ref image: (x, y)
+        # Template center offset from top-left: (x - x1, y - y1)
+        # Template center in cur image: (sx1 + best_dx + (x - x1), sy1 + best_dy + (y - y1))
+        # Displacement: u = cur_x - ref_x, v = cur_y - ref_y
+
+        # Simplified formula (the (x - x1) and -x terms cancel to -x1):
+        u = sx1 + best_dx - x1
+        v = sy1 + best_dy - y1
+
+        print(f"    Displacement calculation:")
+        print(f"      Template center in ref: ({x}, {y})")
+        print(f"      Template bounds: x1={x1}, y1={y1}")
+        print(f"      Search area start: sx1={sx1}, sy1={sy1}")
+        print(f"      Best match in NCC: dx={best_dx}, dy={best_dy}")
+        print(f"      => u = {sx1} + {best_dx} - {x1} = {u}")
+        print(f"      => v = {sy1} + {best_dy} - {y1} = {v}")
 
         return SeedSearchResult(
             x=x, y=y, u=float(u), v=float(v),
@@ -359,7 +292,7 @@ class SeedCalculator:
         Compute NCC map using FFT convolution.
 
         Args:
-            template: Template image (not normalized)
+            template: Template image
             search_area: Search area in current image
 
         Returns:
@@ -381,7 +314,7 @@ class SeedCalculator:
         if template_std < 1e-10:
             return None
 
-        # Flip template for correlation
+        # Flip template for correlation (to get convolution = correlation)
         template_flipped = template_centered[::-1, ::-1]
 
         # Compute mean and std of sliding windows using convolution
@@ -396,123 +329,16 @@ class SeedCalculator:
         local_var = local_sum_sq / n_pixels - local_mean ** 2
         local_std = np.sqrt(np.maximum(local_var, 1e-10))
 
-        # Cross-correlation of centered template with search area
+        # Cross-correlation
         cross_corr = fftconvolve(search_area, template_flipped, mode='valid')
 
-        # Subtract template_mean * local_sum to account for centering
-        # Since template is centered, we need: sum((template - tm) * (window - wm))
-        # = sum(template_centered * window) - sum(template_centered) * wm
-        # = cross_corr - 0 * wm = cross_corr (since template_centered has zero sum)
-        # But actually we convolved with search_area not (search_area - local_mean)
-        # So: sum(template_centered * window) = cross_corr_at_position
-        # And we need: sum(template_centered * (window - local_mean))
-        #            = sum(template_centered * window) - local_mean * sum(template_centered)
-        #            = cross_corr - local_mean * 0 = cross_corr
-
-        # NCC = sum((t - tm)(w - wm)) / sqrt(sum((t-tm)^2) * sum((w-wm)^2))
-        #     = cross_corr / (template_std * sqrt(n) * local_std * sqrt(n))
-        #     = cross_corr / (template_std * local_std * n)
+        # NCC formula: sum((t - tm)(w - wm)) / (n * std_t * std_w)
+        # Since template is centered: sum(t_centered * (w - wm)) / (n * std_t * std_w)
+        # = (sum(t_centered * w) - wm * sum(t_centered)) / (n * std_t * std_w)
+        # = cross_corr / (n * std_t * std_w)  [since sum(t_centered) = 0]
         ncc = cross_corr / (template_std * local_std * n_pixels)
 
         return ncc
-
-    def _ncc_search(
-        self,
-        ref_img: NcorrImage,
-        cur_img: NcorrImage,
-        x: int,
-        y: int,
-        radius: int,
-        search_radius: int,
-    ) -> Optional[SeedSearchResult]:
-        """
-        Perform normalized cross-correlation search (brute-force version).
-
-        This is a fallback method when FFT search fails.
-
-        Args:
-            ref_img: Reference image
-            cur_img: Current image
-            x, y: Center point in reference
-            radius: Subset radius
-            search_radius: Search radius
-
-        Returns:
-            SeedSearchResult or None if failed
-        """
-        ref_gs = ref_img.get_gs()
-        cur_gs = cur_img.get_gs()
-
-        h, w = ref_gs.shape
-
-        # Extract reference template
-        y1 = max(0, y - radius)
-        y2 = min(h, y + radius + 1)
-        x1 = max(0, x - radius)
-        x2 = min(w, x + radius + 1)
-
-        template = ref_gs[y1:y2, x1:x2]
-
-        if template.size == 0:
-            return None
-
-        # Normalize template
-        template_mean = np.mean(template)
-        template_centered = template - template_mean
-        template_norm = np.sqrt(np.sum(template_centered**2))
-
-        if template_norm < 1e-10:
-            return None
-
-        template_normalized = template_centered / template_norm
-
-        # Define search area in current image
-        sy1 = max(0, y - radius - search_radius)
-        sy2 = min(h, y + radius + search_radius + 1)
-        sx1 = max(0, x - radius - search_radius)
-        sx2 = min(w, x + radius + search_radius + 1)
-
-        search_area = cur_gs[sy1:sy2, sx1:sx2]
-
-        if search_area.shape[0] < template.shape[0] or search_area.shape[1] < template.shape[1]:
-            return None
-
-        # Compute NCC using correlation
-        best_ncc = -1
-        best_dx, best_dy = 0, 0
-
-        th, tw = template.shape
-        sh, sw = search_area.shape
-
-        for dy in range(sh - th + 1):
-            for dx in range(sw - tw + 1):
-                window = search_area[dy:dy + th, dx:dx + tw]
-
-                window_mean = np.mean(window)
-                window_centered = window - window_mean
-                window_norm = np.sqrt(np.sum(window_centered**2))
-
-                if window_norm < 1e-10:
-                    continue
-
-                ncc = np.sum(template_normalized * window_centered) / window_norm
-
-                if ncc > best_ncc:
-                    best_ncc = ncc
-                    best_dx = dx
-                    best_dy = dy
-
-        if best_ncc < 0.5:
-            return None
-
-        # Calculate displacement
-        u = (sx1 + best_dx) - x1
-        v = (sy1 + best_dy) - y1
-
-        return SeedSearchResult(
-            x=x, y=y, u=float(u), v=float(v),
-            correlation=best_ncc, converged=True
-        )
 
     def _subpixel_refine(
         self,
@@ -671,7 +497,7 @@ def calculate_seeds(
     cur_img: NcorrImage,
     roi: NcorrROI,
     params: DICParameters,
-    search_radius: int = 100,
+    search_radius: int = 150,
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> List[SeedInfo]:
     """
@@ -682,7 +508,7 @@ def calculate_seeds(
         cur_img: Current image
         roi: Region of interest
         params: DIC parameters
-        search_radius: NCC search radius (default 100 for larger displacements)
+        search_radius: NCC search radius (default 150 for large displacements)
         progress_callback: Progress callback
 
     Returns:
