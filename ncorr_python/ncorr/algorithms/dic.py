@@ -323,59 +323,22 @@ def _compute_ncc(
 
 
 @njit(cache=True, fastmath=True)
-def _solve_6x6(A: NDArray[np.float64], b: NDArray[np.float64]) -> Tuple[NDArray[np.float64], bool]:
-    """
-    Solve 6x6 linear system Ax = b using Gaussian elimination with partial pivoting.
-    """
-    n = 6
-    # Create augmented matrix
-    aug = np.zeros((n, n + 1), dtype=np.float64)
-    for i in range(n):
-        for j in range(n):
-            aug[i, j] = A[i, j]
-        aug[i, n] = b[i]
+def _solve_2x2(H: NDArray[np.float64], b: NDArray[np.float64]) -> Tuple[NDArray[np.float64], bool]:
+    """Solve 2x2 linear system Hx = b."""
+    det = H[0, 0] * H[1, 1] - H[0, 1] * H[1, 0]
 
-    # Forward elimination with partial pivoting
-    for col in range(n):
-        # Find pivot
-        max_val = abs(aug[col, col])
-        max_row = col
-        for row in range(col + 1, n):
-            if abs(aug[row, col]) > max_val:
-                max_val = abs(aug[row, col])
-                max_row = row
+    if abs(det) < 1e-12:
+        return np.zeros(2, dtype=np.float64), False
 
-        if max_val < 1e-12:
-            return np.zeros(n, dtype=np.float64), False
-
-        # Swap rows
-        if max_row != col:
-            for j in range(n + 1):
-                tmp = aug[col, j]
-                aug[col, j] = aug[max_row, j]
-                aug[max_row, j] = tmp
-
-        # Eliminate
-        for row in range(col + 1, n):
-            factor = aug[row, col] / aug[col, col]
-            for j in range(col, n + 1):
-                aug[row, j] -= factor * aug[col, j]
-
-    # Back substitution
-    x = np.zeros(n, dtype=np.float64)
-    for i in range(n - 1, -1, -1):
-        x[i] = aug[i, n]
-        for j in range(i + 1, n):
-            x[i] -= aug[i, j] * x[j]
-        if abs(aug[i, i]) < 1e-12:
-            return np.zeros(n, dtype=np.float64), False
-        x[i] /= aug[i, i]
+    x = np.empty(2, dtype=np.float64)
+    x[0] = (H[1, 1] * b[0] - H[0, 1] * b[1]) / det
+    x[1] = (H[0, 0] * b[1] - H[1, 0] * b[0]) / det
 
     return x, True
 
 
 @njit(cache=True, fastmath=True)
-def _ic_gn_first_order(
+def _ic_gn_translation(
     ref_bcoef: NDArray[np.float64],
     cur_bcoef: NDArray[np.float64],
     border: int,
@@ -388,13 +351,9 @@ def _ic_gn_first_order(
     cutoff_iteration: int,
 ) -> Tuple[float, float, float, bool, int]:
     """
-    IC-GN optimization with first-order (affine) warp model.
+    IC-GN optimization with translation-only (2-parameter) warp model.
 
-    Uses 6 parameters: [u, du/dx, du/dy, v, dv/dx, dv/dy]
-
-    The warp function maps reference subset coordinates to current image:
-    W(Δx, Δy; p) = [x + Δx + u + du/dx*Δx + du/dy*Δy]
-                   [y + Δy + v + dv/dx*Δx + dv/dy*Δy]
+    This is more robust for large displacements as it has fewer parameters.
 
     Args:
         ref_bcoef: Reference image B-spline coefficients
@@ -419,22 +378,13 @@ def _ic_gn_first_order(
     ref_dy = np.empty((size, size), dtype=np.float64)
     mask = np.ones((size, size), dtype=np.bool_)
 
-    # Relative coordinates (Δx, Δy) for each pixel
-    delta_x = np.empty((size, size), dtype=np.float64)
-    delta_y = np.empty((size, size), dtype=np.float64)
-
     valid_count = 0
 
     # Get reference subset with gradients
     for j in range(size):
         for i in range(size):
-            # Relative coordinates from subset center
             dx = float(i - radius)
             dy = float(j - radius)
-            delta_x[j, i] = dx
-            delta_y[j, i] = dy
-
-            # Absolute coordinates in bcoef (with border)
             px = float(x) + dx + border
             py = float(y) + dy + border
 
@@ -475,9 +425,8 @@ def _ic_gn_first_order(
     grad_x_norm = ref_dx / ref_norm
     grad_y_norm = ref_dy / ref_norm
 
-    # Precompute Hessian matrix (6x6) and steepest descent images
-    # Steepest descent: SD = [∂T/∂x, ∂T/∂x*Δx, ∂T/∂x*Δy, ∂T/∂y, ∂T/∂y*Δx, ∂T/∂y*Δy]
-    H = np.zeros((6, 6), dtype=np.float64)
+    # Precompute Hessian matrix (2x2 for translation)
+    H = np.zeros((2, 2), dtype=np.float64)
 
     for j in range(size):
         for i in range(size):
@@ -486,77 +435,23 @@ def _ic_gn_first_order(
 
             gx = grad_x_norm[j, i]
             gy = grad_y_norm[j, i]
-            dx = delta_x[j, i]
-            dy = delta_y[j, i]
 
-            # Steepest descent image at this pixel
-            # SD = [gx, gx*dx, gx*dy, gy, gy*dx, gy*dy]
-            sd0 = gx
-            sd1 = gx * dx
-            sd2 = gx * dy
-            sd3 = gy
-            sd4 = gy * dx
-            sd5 = gy * dy
-
-            # Hessian = sum of outer products SD^T * SD
-            H[0, 0] += sd0 * sd0
-            H[0, 1] += sd0 * sd1
-            H[0, 2] += sd0 * sd2
-            H[0, 3] += sd0 * sd3
-            H[0, 4] += sd0 * sd4
-            H[0, 5] += sd0 * sd5
-
-            H[1, 1] += sd1 * sd1
-            H[1, 2] += sd1 * sd2
-            H[1, 3] += sd1 * sd3
-            H[1, 4] += sd1 * sd4
-            H[1, 5] += sd1 * sd5
-
-            H[2, 2] += sd2 * sd2
-            H[2, 3] += sd2 * sd3
-            H[2, 4] += sd2 * sd4
-            H[2, 5] += sd2 * sd5
-
-            H[3, 3] += sd3 * sd3
-            H[3, 4] += sd3 * sd4
-            H[3, 5] += sd3 * sd5
-
-            H[4, 4] += sd4 * sd4
-            H[4, 5] += sd4 * sd5
-
-            H[5, 5] += sd5 * sd5
-
-    # Hessian is symmetric
-    H[1, 0] = H[0, 1]
-    H[2, 0] = H[0, 2]
-    H[2, 1] = H[1, 2]
-    H[3, 0] = H[0, 3]
-    H[3, 1] = H[1, 3]
-    H[3, 2] = H[2, 3]
-    H[4, 0] = H[0, 4]
-    H[4, 1] = H[1, 4]
-    H[4, 2] = H[2, 4]
-    H[4, 3] = H[3, 4]
-    H[5, 0] = H[0, 5]
-    H[5, 1] = H[1, 5]
-    H[5, 2] = H[2, 5]
-    H[5, 3] = H[3, 5]
-    H[5, 4] = H[4, 5]
+            H[0, 0] += gx * gx
+            H[0, 1] += gx * gy
+            H[1, 0] += gy * gx
+            H[1, 1] += gy * gy
 
     # Reference normalized
     ref_normalized = ref_centered / ref_norm
 
-    # Initialize warp parameters: [u, du/dx, du/dy, v, dv/dx, dv/dy]
-    p = np.zeros(6, dtype=np.float64)
-    p[0] = u_init  # u
-    p[3] = v_init  # v
-    # Deformation gradients start at zero (no deformation)
-
+    # Initialize parameters
+    u, v = u_init, v_init
     converged = False
     final_iteration = 0
 
     for iteration in range(cutoff_iteration):
         final_iteration = iteration + 1
+
         # Get current subset at warped location
         cur_subset = np.empty((size, size), dtype=np.float64)
         all_valid = True
@@ -567,14 +462,12 @@ def _ic_gn_first_order(
                     cur_subset[j, i] = 0.0
                     continue
 
-                dx = delta_x[j, i]
-                dy = delta_y[j, i]
+                dx = float(i - radius)
+                dy = float(j - radius)
 
-                # Warp: W(dx, dy; p)
-                # wx = x + dx + u + du/dx*dx + du/dy*dy
-                # wy = y + dy + v + dv/dx*dx + dv/dy*dy
-                wx = float(x) + dx + p[0] + p[1] * dx + p[2] * dy + border
-                wy = float(y) + dy + p[3] + p[4] * dx + p[5] * dy + border
+                # Translation-only warp
+                wx = float(x) + dx + u + border
+                wy = float(y) + dy + v + border
 
                 if wx < 2.0 or wx >= w_cur - 3.0 or wy < 2.0 or wy >= h_cur - 3.0:
                     all_valid = False
@@ -607,43 +500,27 @@ def _ic_gn_first_order(
         # Error image
         error = ref_normalized - cur_normalized
 
-        # Compute gradient: b = Σ SD^T * error
-        b = np.zeros(6, dtype=np.float64)
+        # Compute gradient
+        b = np.zeros(2, dtype=np.float64)
         for j in range(size):
             for i in range(size):
                 if not mask[j, i]:
                     continue
 
-                gx = grad_x_norm[j, i]
-                gy = grad_y_norm[j, i]
-                dx = delta_x[j, i]
-                dy = delta_y[j, i]
-                e = error[j, i]
+                b[0] += grad_x_norm[j, i] * error[j, i]
+                b[1] += grad_y_norm[j, i] * error[j, i]
 
-                b[0] += gx * e
-                b[1] += gx * dx * e
-                b[2] += gx * dy * e
-                b[3] += gy * e
-                b[4] += gy * dx * e
-                b[5] += gy * dy * e
-
-        # Solve for parameter update
-        dp, success = _solve_6x6(H, b)
+        # Solve for update
+        dp, success = _solve_2x2(H, b)
         if not success:
             break
 
-        # Update parameters (inverse compositional update)
-        # For first-order warp, the update is more complex
-        # Simplified: just add the updates (forward additive approximation)
-        p[0] += dp[0]
-        p[1] += dp[1]
-        p[2] += dp[2]
-        p[3] += dp[3]
-        p[4] += dp[4]
-        p[5] += dp[5]
+        # Update parameters
+        u += dp[0]
+        v += dp[1]
 
-        # Check convergence (norm of displacement update)
-        diffnorm = np.sqrt(dp[0] * dp[0] + dp[3] * dp[3])
+        # Check convergence
+        diffnorm = np.sqrt(dp[0] * dp[0] + dp[1] * dp[1])
         if diffnorm < cutoff_diffnorm:
             converged = True
             break
@@ -658,11 +535,11 @@ def _ic_gn_first_order(
                 cur_subset[j, i] = 0.0
                 continue
 
-            dx = delta_x[j, i]
-            dy = delta_y[j, i]
+            dx = float(i - radius)
+            dy = float(j - radius)
 
-            wx = float(x) + dx + p[0] + p[1] * dx + p[2] * dy + border
-            wy = float(y) + dy + p[3] + p[4] * dx + p[5] * dy + border
+            wx = float(x) + dx + u + border
+            wy = float(y) + dy + v + border
 
             if wx < 2.0 or wx >= w_cur - 3.0 or wy < 2.0 or wy >= h_cur - 3.0:
                 all_valid = False
@@ -691,8 +568,12 @@ def _ic_gn_first_order(
 
     ncc = _compute_ncc(ref_centered, cur_centered, ref_norm, cur_norm, mask)
 
-    # Return displacement at subset center (u, v)
-    return p[0], p[3], ncc, converged, final_iteration
+    return u, v, ncc, converged, final_iteration
+
+
+# Alias for backwards compatibility
+_ic_gn_first_order = _ic_gn_translation
+_ic_gn_single_point = _ic_gn_translation
 
 
 @njit(cache=True, fastmath=True)
@@ -717,8 +598,59 @@ def _check_point_in_region(
     return False
 
 
-# Alias for backwards compatibility
-_ic_gn_single_point = _ic_gn_first_order
+@njit(cache=True, parallel=True)
+def _process_points_parallel(
+    ref_bcoef: NDArray[np.float64],
+    cur_bcoef: NDArray[np.float64],
+    border: int,
+    points_x: NDArray[np.int32],
+    points_y: NDArray[np.int32],
+    u_init: NDArray[np.float64],
+    v_init: NDArray[np.float64],
+    radius: int,
+    cutoff_diffnorm: float,
+    cutoff_iteration: int,
+) -> Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64],
+           NDArray[np.bool_], NDArray[np.int32]]:
+    """
+    Process multiple points in parallel.
+
+    Args:
+        ref_bcoef: Reference B-spline coefficients
+        cur_bcoef: Current B-spline coefficients
+        border: Border size
+        points_x, points_y: Point coordinates
+        u_init, v_init: Initial displacement guesses
+        radius: Subset radius
+        cutoff_diffnorm: Convergence threshold
+        cutoff_iteration: Maximum iterations
+
+    Returns:
+        Tuple of (u, v, corrcoef, converged, iterations) arrays
+    """
+    n_points = len(points_x)
+
+    u_out = np.empty(n_points, dtype=np.float64)
+    v_out = np.empty(n_points, dtype=np.float64)
+    cc_out = np.empty(n_points, dtype=np.float64)
+    conv_out = np.empty(n_points, dtype=np.bool_)
+    iter_out = np.empty(n_points, dtype=np.int32)
+
+    for idx in prange(n_points):
+        u, v, cc, conv, n_iter = _ic_gn_translation(
+            ref_bcoef, cur_bcoef, border,
+            points_x[idx], points_y[idx], radius,
+            u_init[idx], v_init[idx],
+            cutoff_diffnorm, cutoff_iteration,
+        )
+
+        u_out[idx] = u
+        v_out[idx] = v
+        cc_out[idx] = cc
+        conv_out[idx] = conv
+        iter_out[idx] = n_iter
+
+    return u_out, v_out, cc_out, conv_out, iter_out
 
 
 # =============================================================================
@@ -730,7 +662,7 @@ class DICAnalysis:
     Digital Image Correlation analysis using IC-GN algorithm.
 
     The IC-GN algorithm uses an inverse compositional Gauss-Newton
-    optimization with first-order (affine) warp to find subpixel
+    optimization with translation warp to find subpixel
     displacements between a reference and current image.
     """
 
@@ -796,15 +728,6 @@ class DICAnalysis:
     ) -> DICResult:
         """
         Analyze single image pair.
-
-        Args:
-            ref_img: Reference image
-            cur_img: Current image
-            roi: Region of interest
-            seeds: Seed points
-
-        Returns:
-            DIC result
         """
         # Get image data
         ref_bcoef = ref_img.get_bcoef()
@@ -900,29 +823,28 @@ class DICAnalysis:
         """
         Process a single region using flood-fill from seed.
 
-        Optimized version using deque and Numba-accelerated IC-GN.
-        Only propagates results with good correlation (CC > 0.8) to prevent
-        cascade failures.
+        Uses parallel batch processing when possible.
         """
         radius = self.params.radius
         cutoff_diffnorm = self.params.cutoff_diffnorm
         cutoff_iteration = self.params.cutoff_iteration
 
         # Minimum correlation to propagate result as initial guess
-        min_cc_for_propagation = 0.8
+        min_cc_for_propagation = 0.9
 
         # Get region data for in-region checking
         leftbound = region.leftbound
         noderange = np.asarray(region.noderange, dtype=np.int32)
         nodelist = np.asarray(region.nodelist, dtype=np.int32)
 
-        # Queue for flood-fill processing (using deque for efficiency)
-        # Format: (x, y, u_guess, v_guess, fallback_u, fallback_v)
-        queue = deque([(seed.x, seed.y, seed.u, seed.v, seed.u, seed.v)])
+        # First, collect all points in region
+        out_h, out_w = u_plot.shape
+
+        # Queue for flood-fill processing
+        # Format: (x, y, u_guess, v_guess)
+        queue = deque([(seed.x, seed.y, seed.u, seed.v)])
         processed = set()
         points_processed = 0
-
-        out_h, out_w = u_plot.shape
 
         # Estimate total points if not provided
         if estimated_points <= 0:
@@ -930,72 +852,73 @@ class DICAnalysis:
 
         # Progress reporting at 1% increments
         last_progress_percent = -1
-        progress_interval = max(1, estimated_points // 100)
 
-        while queue:
-            x, y, u_guess, v_guess, fallback_u, fallback_v = queue.popleft()
+        # Batch processing parameters
+        batch_size = 1000
+        batch_points_x = []
+        batch_points_y = []
+        batch_u_init = []
+        batch_v_init = []
+        batch_ox = []
+        batch_oy = []
 
-            # Convert to output coordinates
-            ox, oy = x // step, y // step
+        def process_batch():
+            """Process accumulated batch of points in parallel."""
+            nonlocal points_processed, last_progress_percent
 
-            if (x, y) in processed:
-                continue
+            if not batch_points_x:
+                return
 
-            if not (0 <= oy < out_h and 0 <= ox < out_w):
-                continue
+            # Convert to arrays
+            px = np.array(batch_points_x, dtype=np.int32)
+            py = np.array(batch_points_y, dtype=np.int32)
+            ui = np.array(batch_u_init, dtype=np.float64)
+            vi = np.array(batch_v_init, dtype=np.float64)
 
-            processed.add((x, y))
-
-            # Check if point is in region
-            if not _check_point_in_region(x, y, leftbound, noderange, nodelist):
-                continue
-
-            # Perform IC-GN optimization with first-order warp (Numba-accelerated)
-            u, v, cc, conv, n_iter = _ic_gn_first_order(
+            # Process in parallel
+            u_res, v_res, cc_res, conv_res, iter_res = _process_points_parallel(
                 ref_bcoef, cur_bcoef, border,
-                x, y, radius,
-                u_guess, v_guess,
-                cutoff_diffnorm, cutoff_iteration,
+                px, py, ui, vi,
+                radius, cutoff_diffnorm, cutoff_iteration,
             )
 
-            # If first attempt failed, try with fallback guess
-            if np.isnan(u) or cc < min_cc_for_propagation:
-                if abs(fallback_u - u_guess) > 0.1 or abs(fallback_v - v_guess) > 0.1:
-                    u2, v2, cc2, conv2, n_iter2 = _ic_gn_first_order(
-                        ref_bcoef, cur_bcoef, border,
-                        x, y, radius,
-                        fallback_u, fallback_v,
-                        cutoff_diffnorm, cutoff_iteration,
-                    )
-                    if not np.isnan(u2) and cc2 > cc:
-                        u, v, cc, conv, n_iter = u2, v2, cc2, conv2, n_iter2
+            # Store results
+            for idx in range(len(batch_points_x)):
+                ox = batch_ox[idx]
+                oy = batch_oy[idx]
 
-            if not np.isnan(u):
-                u_plot[oy, ox] = u
-                v_plot[oy, ox] = v
-                corrcoef_plot[oy, ox] = cc
-                roi_plot[oy, ox] = True
-                converged[oy, ox] = conv
-                iterations[oy, ox] = n_iter
-                points_processed += 1
+                if not np.isnan(u_res[idx]):
+                    u_plot[oy, ox] = u_res[idx]
+                    v_plot[oy, ox] = v_res[idx]
+                    corrcoef_plot[oy, ox] = cc_res[idx]
+                    roi_plot[oy, ox] = True
+                    converged[oy, ox] = conv_res[idx]
+                    iterations[oy, ox] = iter_res[idx]
+                    points_processed += 1
 
-                # Determine what to propagate to neighbors
-                # Only propagate good results, otherwise use fallback
-                if cc >= min_cc_for_propagation:
-                    next_u, next_v = u, v
-                    next_fallback_u, next_fallback_v = fallback_u, fallback_v
-                else:
-                    # Bad correlation - use fallback for neighbors
-                    next_u, next_v = fallback_u, fallback_v
-                    next_fallback_u, next_fallback_v = fallback_u, fallback_v
+                    # Add neighbors to queue with good results
+                    x = batch_points_x[idx]
+                    y = batch_points_y[idx]
 
-                # Add neighbors to queue
-                for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
-                    nx, ny = x + dx, y + dy
-                    if (nx, ny) not in processed:
-                        queue.append((nx, ny, next_u, next_v, next_fallback_u, next_fallback_v))
+                    if cc_res[idx] >= min_cc_for_propagation:
+                        next_u, next_v = u_res[idx], v_res[idx]
+                    else:
+                        next_u, next_v = seed.u, seed.v
 
-            # Progress reporting at 1% increments
+                    for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
+                        nx, ny = x + dx, y + dy
+                        if (nx, ny) not in processed:
+                            queue.append((nx, ny, next_u, next_v))
+
+            # Clear batch
+            batch_points_x.clear()
+            batch_points_y.clear()
+            batch_u_init.clear()
+            batch_v_init.clear()
+            batch_ox.clear()
+            batch_oy.clear()
+
+            # Progress reporting
             current_percent = int(points_processed * 100 / max(1, estimated_points))
             if current_percent > last_progress_percent and self._progress_callback:
                 last_progress_percent = current_percent
@@ -1004,6 +927,38 @@ class DICAnalysis:
                     progress,
                     f"Processing... {points_processed:,}/{estimated_points:,} points ({current_percent}%)"
                 )
+
+        while queue or batch_points_x:
+            # Fill batch from queue
+            while queue and len(batch_points_x) < batch_size:
+                x, y, u_guess, v_guess = queue.popleft()
+
+                # Convert to output coordinates
+                ox, oy = x // step, y // step
+
+                if (x, y) in processed:
+                    continue
+
+                if not (0 <= oy < out_h and 0 <= ox < out_w):
+                    continue
+
+                processed.add((x, y))
+
+                # Check if point is in region
+                if not _check_point_in_region(x, y, leftbound, noderange, nodelist):
+                    continue
+
+                # Add to batch
+                batch_points_x.append(x)
+                batch_points_y.append(y)
+                batch_u_init.append(u_guess)
+                batch_v_init.append(v_guess)
+                batch_ox.append(ox)
+                batch_oy.append(oy)
+
+            # Process batch if full or queue is empty
+            if len(batch_points_x) >= batch_size or (not queue and batch_points_x):
+                process_batch()
 
         return points_processed
 
