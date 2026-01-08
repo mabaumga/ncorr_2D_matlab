@@ -323,6 +323,140 @@ def _compute_ncc(
 
 
 @njit(cache=True, fastmath=True)
+def _local_ncc_search(
+    ref_bcoef: NDArray[np.float64],
+    cur_bcoef: NDArray[np.float64],
+    border: int,
+    x: int,
+    y: int,
+    radius: int,
+    u_init: float,
+    v_init: float,
+    search_radius: int = 3,
+) -> Tuple[float, float, float]:
+    """
+    Perform local NCC search around initial guess to find best integer displacement.
+
+    This prevents convergence to wrong local minima by ensuring we start in the
+    correct "basin of attraction" for the IC-GN optimization.
+
+    Args:
+        ref_bcoef: Reference B-spline coefficients
+        cur_bcoef: Current B-spline coefficients
+        border: Border padding
+        x, y: Subset center coordinates
+        radius: Subset radius
+        u_init, v_init: Initial displacement guess
+        search_radius: Search range around initial guess (default ±3 pixels)
+
+    Returns:
+        Tuple of (best_u, best_v, best_ncc)
+    """
+    size = 2 * radius + 1
+    h_ref, w_ref = ref_bcoef.shape
+    h_cur, w_cur = cur_bcoef.shape
+
+    # Extract reference subset
+    ref_subset = np.empty((size, size), dtype=np.float64)
+    mask = np.ones((size, size), dtype=np.bool_)
+    valid_count = 0
+
+    for j in range(size):
+        for i in range(size):
+            dx = float(i - radius)
+            dy = float(j - radius)
+            px = float(x) + dx + border
+            py = float(y) + dy + border
+
+            if px < 2.0 or px >= w_ref - 3.0 or py < 2.0 or py >= h_ref - 3.0:
+                mask[j, i] = False
+                ref_subset[j, i] = 0.0
+                continue
+
+            val = _bspline_interp(px, py, ref_bcoef)
+            if np.isnan(val):
+                mask[j, i] = False
+                ref_subset[j, i] = 0.0
+                continue
+
+            ref_subset[j, i] = val
+            valid_count += 1
+
+    if valid_count < 20:
+        return u_init, v_init, 0.0
+
+    # Reference statistics
+    ref_mean = _masked_mean(ref_subset, mask)
+    ref_centered = ref_subset - ref_mean
+    ref_norm = _masked_norm(ref_centered, mask)
+
+    if ref_norm < 1e-10:
+        return u_init, v_init, 0.0
+
+    # Search around initial guess
+    best_u = u_init
+    best_v = v_init
+    best_ncc = -1.0
+
+    u_center = int(round(u_init))
+    v_center = int(round(v_init))
+
+    cur_subset = np.empty((size, size), dtype=np.float64)
+
+    for du in range(-search_radius, search_radius + 1):
+        for dv in range(-search_radius, search_radius + 1):
+            u_test = float(u_center + du)
+            v_test = float(v_center + dv)
+
+            # Extract current subset at this displacement
+            all_valid = True
+            for j in range(size):
+                for i in range(size):
+                    if not mask[j, i]:
+                        cur_subset[j, i] = 0.0
+                        continue
+
+                    dx = float(i - radius)
+                    dy = float(j - radius)
+                    wx = float(x) + dx + u_test + border
+                    wy = float(y) + dy + v_test + border
+
+                    if wx < 2.0 or wx >= w_cur - 3.0 or wy < 2.0 or wy >= h_cur - 3.0:
+                        all_valid = False
+                        break
+
+                    val = _bspline_interp(wx, wy, cur_bcoef)
+                    if np.isnan(val):
+                        all_valid = False
+                        break
+
+                    cur_subset[j, i] = val
+
+                if not all_valid:
+                    break
+
+            if not all_valid:
+                continue
+
+            # Compute NCC
+            cur_mean = _masked_mean(cur_subset, mask)
+            cur_centered = cur_subset - cur_mean
+            cur_norm = _masked_norm(cur_centered, mask)
+
+            if cur_norm < 1e-10:
+                continue
+
+            ncc = _compute_ncc(ref_centered, cur_centered, ref_norm, cur_norm, mask)
+
+            if ncc > best_ncc:
+                best_ncc = ncc
+                best_u = u_test
+                best_v = v_test
+
+    return best_u, best_v, best_ncc
+
+
+@njit(cache=True, fastmath=True)
 def _solve_2x2(H: NDArray[np.float64], b: NDArray[np.float64]) -> Tuple[NDArray[np.float64], bool]:
     """Solve 2x2 linear system Hx = b."""
     det = H[0, 0] * H[1, 1] - H[0, 1] * H[1, 0]
@@ -942,6 +1076,41 @@ def _check_point_in_region(
 
 
 @njit(cache=True, parallel=True)
+def _refine_initial_guesses_parallel(
+    ref_bcoef: NDArray[np.float64],
+    cur_bcoef: NDArray[np.float64],
+    border: int,
+    points_x: NDArray[np.int32],
+    points_y: NDArray[np.int32],
+    u_init: NDArray[np.float64],
+    v_init: NDArray[np.float64],
+    radius: int,
+    search_radius: int = 3,
+) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """
+    Refine initial displacement guesses using local NCC search.
+
+    This ensures each point starts IC-GN from the correct integer displacement,
+    preventing convergence to wrong local minima and eliminating banding artifacts.
+    """
+    n_points = len(points_x)
+    u_refined = np.empty(n_points, dtype=np.float64)
+    v_refined = np.empty(n_points, dtype=np.float64)
+
+    for idx in prange(n_points):
+        u, v, _ = _local_ncc_search(
+            ref_bcoef, cur_bcoef, border,
+            points_x[idx], points_y[idx], radius,
+            u_init[idx], v_init[idx],
+            search_radius,
+        )
+        u_refined[idx] = u
+        v_refined[idx] = v
+
+    return u_refined, v_refined
+
+
+@njit(cache=True, parallel=True)
 def _process_points_parallel_translation(
     ref_bcoef: NDArray[np.float64],
     cur_bcoef: NDArray[np.float64],
@@ -1329,6 +1498,14 @@ class DICAnalysis:
             ui = np.array(batch_u_init, dtype=np.float64)
             vi = np.array(batch_v_init, dtype=np.float64)
 
+            # STEP 1: Refine initial guesses with local NCC search
+            # This prevents banding by ensuring we start in the correct basin
+            ui_refined, vi_refined = _refine_initial_guesses_parallel(
+                ref_bcoef, cur_bcoef, border,
+                px, py, ui, vi,
+                radius, 3,  # search_radius = ±3 pixels
+            )
+
             # Get strain initial guesses from stored data
             dudxi = np.zeros(len(px), dtype=np.float64)
             dudyi = np.zeros(len(px), dtype=np.float64)
@@ -1344,13 +1521,13 @@ class DICAnalysis:
                 print(f"\nDEBUG First batch:")
                 print(f"  Number of points: {len(px)}")
                 for i in range(min(5, len(px))):
-                    print(f"  Point {i}: ({px[i]}, {py[i]}) with init u={ui[i]:.4f}, v={vi[i]:.4f}")
+                    print(f"  Point {i}: ({px[i]}, {py[i]}) init u={ui[i]:.4f}, v={vi[i]:.4f} -> refined u={ui_refined[i]:.4f}, v={vi_refined[i]:.4f}")
 
-            # Process in parallel with AFFINE model (captures strain)
+            # STEP 2: Process in parallel with AFFINE model (captures strain)
             (u_res, v_res, dudx_res, dudy_res, dvdx_res, dvdy_res,
              cc_res, conv_res, iter_res) = _process_points_parallel(
                 ref_bcoef, cur_bcoef, border,
-                px, py, ui, vi, dudxi, dudyi, dvdxi, dvdyi,
+                px, py, ui_refined, vi_refined, dudxi, dudyi, dvdxi, dvdyi,
                 radius, cutoff_diffnorm, cutoff_iteration,
             )
 
