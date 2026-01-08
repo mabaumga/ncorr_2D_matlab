@@ -1494,8 +1494,8 @@ class DICAnalysis:
         # Progress reporting at 1% increments
         last_progress_percent = -1
 
-        # Batch processing parameters
-        batch_size = 1000
+        # Batch processing parameters - smaller batches for better neighbor consistency
+        batch_size = 100
         batch_points_x = []
         batch_points_y = []
         batch_u_init = []
@@ -1505,11 +1505,8 @@ class DICAnalysis:
 
         debug_batch_count = [0]  # Use list to allow modification in nested function
 
-        # Store strain parameters for propagation
-        strain_data = {}  # (x, y) -> (dudx, dudy, dvdx, dvdy)
-
         def process_batch():
-            """Process accumulated batch of points in parallel using affine model."""
+            """Process accumulated batch of points in parallel using translation model."""
             nonlocal points_processed, last_progress_percent
 
             if not batch_points_x:
@@ -1521,37 +1518,25 @@ class DICAnalysis:
             ui = np.array(batch_u_init, dtype=np.float64)
             vi = np.array(batch_v_init, dtype=np.float64)
 
-            # Get strain initial guesses from stored data
-            dudxi = np.zeros(len(px), dtype=np.float64)
-            dudyi = np.zeros(len(px), dtype=np.float64)
-            dvdxi = np.zeros(len(px), dtype=np.float64)
-            dvdyi = np.zeros(len(px), dtype=np.float64)
-
-            for i, (bx, by) in enumerate(zip(batch_points_x, batch_points_y)):
-                if (bx, by) in strain_data:
-                    dudxi[i], dudyi[i], dvdxi[i], dvdyi[i] = strain_data[(bx, by)]
-
             # DEBUG: Print first batch info
             if debug_batch_count[0] == 0:
-                print(f"\nDEBUG First batch:")
+                print(f"\nDEBUG First batch (Translation model, batch_size={batch_size}):")
                 print(f"  Number of points: {len(px)}")
                 for i in range(min(5, len(px))):
                     print(f"  Point {i}: ({px[i]}, {py[i]}) init u={ui[i]:.4f}, v={vi[i]:.4f}")
 
-            # Process in parallel with AFFINE model (captures strain)
-            (u_res, v_res, dudx_res, dudy_res, dvdx_res, dvdy_res,
-             cc_res, conv_res, iter_res) = _process_points_parallel(
+            # Process in parallel with TRANSLATION model (more stable)
+            u_res, v_res, cc_res, conv_res, iter_res = _process_points_parallel_translation(
                 ref_bcoef, cur_bcoef, border,
-                px, py, ui, vi, dudxi, dudyi, dvdxi, dvdyi,
+                px, py, ui, vi,
                 radius, cutoff_diffnorm, cutoff_iteration,
             )
 
             # DEBUG: Print first batch results
             if debug_batch_count[0] == 0:
-                print(f"\nDEBUG First batch RESULTS (Affine model):")
+                print(f"\nDEBUG First batch RESULTS (Translation model):")
                 for i in range(min(5, len(px))):
                     print(f"  Point {i}: u={u_res[i]:.4f}, v={v_res[i]:.4f}, CC={cc_res[i]:.4f}, conv={conv_res[i]}, iter={iter_res[i]}")
-                    print(f"           dudx={dudx_res[i]:.6f}, dudy={dudy_res[i]:.6f}, dvdx={dvdx_res[i]:.6f}, dvdy={dvdy_res[i]:.6f}")
                 debug_batch_count[0] += 1
 
             # Store results
@@ -1573,23 +1558,14 @@ class DICAnalysis:
                     y = batch_points_y[idx]
 
                     if cc_res[idx] >= min_cc_for_propagation:
-                        # Propagate with strain-predicted displacement
+                        # Simple propagation: just pass the displacement
                         cur_u = u_res[idx]
                         cur_v = v_res[idx]
-                        cur_dudx = dudx_res[idx]
-                        cur_dudy = dudy_res[idx]
-                        cur_dvdx = dvdx_res[idx]
-                        cur_dvdy = dvdy_res[idx]
 
                         for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
                             nx, ny = x + dx, y + dy
                             if (nx, ny) not in processed:
-                                # Predict displacement at neighbor using strain
-                                next_u = cur_u + cur_dudx * dx + cur_dudy * dy
-                                next_v = cur_v + cur_dvdx * dx + cur_dvdy * dy
-                                queue.append((nx, ny, next_u, next_v))
-                                # Store strain for this neighbor
-                                strain_data[(nx, ny)] = (cur_dudx, cur_dudy, cur_dvdx, cur_dvdy)
+                                queue.append((nx, ny, cur_u, cur_v))
                     else:
                         # Fall back to seed displacement
                         for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
