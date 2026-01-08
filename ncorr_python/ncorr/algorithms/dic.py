@@ -1246,6 +1246,38 @@ class DICAnalysis:
         cutoff_diffnorm = self.params.cutoff_diffnorm
         cutoff_iteration = self.params.cutoff_iteration
 
+        # DEBUG: Print seed and parameters
+        print(f"\n{'='*60}")
+        print(f"DEBUG _process_region_optimized:")
+        print(f"  Seed position: ({seed.x}, {seed.y})")
+        print(f"  Seed displacement: u={seed.u:.4f}, v={seed.v:.4f}")
+        print(f"  Radius: {radius}, Step: {step}")
+        print(f"  Border: {border}")
+        print(f"  ref_bcoef shape: {ref_bcoef.shape}")
+        print(f"  cur_bcoef shape: {cur_bcoef.shape}")
+        print(f"  cutoff_diffnorm: {cutoff_diffnorm}, cutoff_iteration: {cutoff_iteration}")
+
+        # DEBUG: Test IC-GN directly at seed point
+        print(f"\nDEBUG: Testing IC-GN directly at seed point...")
+        test_u, test_v, test_cc, test_conv, test_iter = _ic_gn_translation(
+            ref_bcoef, cur_bcoef, border,
+            seed.x, seed.y, radius,
+            seed.u, seed.v,
+            cutoff_diffnorm, cutoff_iteration,
+        )
+        print(f"  Direct IC-GN result: u={test_u:.4f}, v={test_v:.4f}, CC={test_cc:.4f}, conv={test_conv}, iter={test_iter}")
+
+        # DEBUG: Also test with zero initial guess
+        print(f"\nDEBUG: Testing IC-GN with zero initial guess...")
+        test_u0, test_v0, test_cc0, test_conv0, test_iter0 = _ic_gn_translation(
+            ref_bcoef, cur_bcoef, border,
+            seed.x, seed.y, radius,
+            0.0, 0.0,
+            cutoff_diffnorm, cutoff_iteration,
+        )
+        print(f"  Zero-init IC-GN result: u={test_u0:.4f}, v={test_v0:.4f}, CC={test_cc0:.4f}, conv={test_conv0}, iter={test_iter0}")
+        print(f"{'='*60}")
+
         # Minimum correlation to propagate result as initial guess
         min_cc_for_propagation = 0.9
 
@@ -1279,6 +1311,8 @@ class DICAnalysis:
         batch_ox = []
         batch_oy = []
 
+        debug_batch_count = [0]  # Use list to allow modification in nested function
+
         def process_batch():
             """Process accumulated batch of points in parallel using translation model."""
             nonlocal points_processed, last_progress_percent
@@ -1292,12 +1326,26 @@ class DICAnalysis:
             ui = np.array(batch_u_init, dtype=np.float64)
             vi = np.array(batch_v_init, dtype=np.float64)
 
+            # DEBUG: Print first batch info
+            if debug_batch_count[0] == 0:
+                print(f"\nDEBUG First batch:")
+                print(f"  Number of points: {len(px)}")
+                for i in range(min(5, len(px))):
+                    print(f"  Point {i}: ({px[i]}, {py[i]}) with init u={ui[i]:.4f}, v={vi[i]:.4f}")
+
             # Process in parallel with translation model (more robust)
             u_res, v_res, cc_res, conv_res, iter_res = _process_points_parallel_translation(
                 ref_bcoef, cur_bcoef, border,
                 px, py, ui, vi,
                 radius, cutoff_diffnorm, cutoff_iteration,
             )
+
+            # DEBUG: Print first batch results
+            if debug_batch_count[0] == 0:
+                print(f"\nDEBUG First batch RESULTS:")
+                for i in range(min(5, len(px))):
+                    print(f"  Point {i}: u={u_res[i]:.4f}, v={v_res[i]:.4f}, CC={cc_res[i]:.4f}, conv={conv_res[i]}, iter={iter_res[i]}")
+                debug_batch_count[0] += 1
 
             # Store results
             for idx in range(len(batch_points_x)):
