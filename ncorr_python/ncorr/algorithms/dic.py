@@ -723,12 +723,16 @@ class DICAnalysis:
 
             region = roi.regions[region_idx]
 
+            # Estimate number of points in this region
+            estimated_points = region.totalpoints // (step * step) if region.totalpoints > 0 else out_h * out_w
+
             # Perform IC-GN for this region using optimized flood-fill
             points_processed = self._process_region_optimized(
                 ref_bcoef, cur_bcoef, border,
                 region, seed,
                 u_plot, v_plot, corrcoef_plot, roi_plot, converged,
-                step
+                step,
+                estimated_points
             )
             total_points += points_processed
 
@@ -769,6 +773,7 @@ class DICAnalysis:
         roi_plot: NDArray[np.bool_],
         converged: NDArray[np.bool_],
         step: int,
+        estimated_points: int = 0,
     ) -> int:
         """
         Process a single region using flood-fill from seed.
@@ -790,6 +795,10 @@ class DICAnalysis:
         points_processed = 0
 
         out_h, out_w = u_plot.shape
+
+        # Estimate total points if not provided
+        if estimated_points <= 0:
+            estimated_points = region.totalpoints // (step * step) if region.totalpoints > 0 else 10000
 
         while queue:
             x, y, u_guess, v_guess = queue.popleft()
@@ -831,11 +840,12 @@ class DICAnalysis:
                     if (nx, ny) not in processed:
                         queue.append((nx, ny, u, v))
 
-            # Progress reporting (every 100 points)
-            if points_processed % 100 == 0 and self._progress_callback:
+            # Progress reporting (every 50 points for more responsive updates)
+            if points_processed % 50 == 0 and self._progress_callback:
+                progress = min(0.99, points_processed / max(1, estimated_points))
                 self._report_progress(
-                    min(0.99, points_processed / 1000),
-                    f"Processing... {points_processed} points"
+                    progress,
+                    f"Processing... {points_processed}/{estimated_points} points ({progress*100:.0f}%)"
                 )
 
         return points_processed
