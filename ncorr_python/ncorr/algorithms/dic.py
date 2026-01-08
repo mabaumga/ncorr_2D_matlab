@@ -338,6 +338,56 @@ def _solve_2x2(H: NDArray[np.float64], b: NDArray[np.float64]) -> Tuple[NDArray[
 
 
 @njit(cache=True, fastmath=True)
+def _solve_6x6(H: NDArray[np.float64], b: NDArray[np.float64]) -> Tuple[NDArray[np.float64], bool]:
+    """Solve 6x6 linear system Hx = b using Gaussian elimination with partial pivoting."""
+    n = 6
+    # Create augmented matrix
+    A = np.empty((n, n + 1), dtype=np.float64)
+    for i in range(n):
+        for j in range(n):
+            A[i, j] = H[i, j]
+        A[i, n] = b[i]
+
+    # Forward elimination with partial pivoting
+    for k in range(n):
+        # Find pivot
+        max_val = abs(A[k, k])
+        max_row = k
+        for i in range(k + 1, n):
+            if abs(A[i, k]) > max_val:
+                max_val = abs(A[i, k])
+                max_row = i
+
+        if max_val < 1e-12:
+            return np.zeros(n, dtype=np.float64), False
+
+        # Swap rows
+        if max_row != k:
+            for j in range(k, n + 1):
+                tmp = A[k, j]
+                A[k, j] = A[max_row, j]
+                A[max_row, j] = tmp
+
+        # Eliminate
+        for i in range(k + 1, n):
+            factor = A[i, k] / A[k, k]
+            for j in range(k, n + 1):
+                A[i, j] -= factor * A[k, j]
+
+    # Back substitution
+    x = np.zeros(n, dtype=np.float64)
+    for i in range(n - 1, -1, -1):
+        x[i] = A[i, n]
+        for j in range(i + 1, n):
+            x[i] -= A[i, j] * x[j]
+        if abs(A[i, i]) < 1e-12:
+            return np.zeros(n, dtype=np.float64), False
+        x[i] /= A[i, i]
+
+    return x, True
+
+
+@njit(cache=True, fastmath=True)
 def _ic_gn_translation(
     ref_bcoef: NDArray[np.float64],
     cur_bcoef: NDArray[np.float64],
@@ -571,8 +621,301 @@ def _ic_gn_translation(
     return u, v, ncc, converged, final_iteration
 
 
+@njit(cache=True, fastmath=True)
+def _ic_gn_affine(
+    ref_bcoef: NDArray[np.float64],
+    cur_bcoef: NDArray[np.float64],
+    border: int,
+    x: int,
+    y: int,
+    radius: int,
+    u_init: float,
+    v_init: float,
+    dudx_init: float,
+    dudy_init: float,
+    dvdx_init: float,
+    dvdy_init: float,
+    cutoff_diffnorm: float,
+    cutoff_iteration: int,
+) -> Tuple[float, float, float, float, float, float, float, bool, int]:
+    """
+    IC-GN optimization with first-order affine (6-parameter) warp model.
+
+    This model captures both displacement and strain (displacement gradients).
+
+    Warp model:
+        wx = x + dx + u + dudx*dx + dudy*dy
+        wy = y + dy + v + dvdx*dx + dvdy*dy
+
+    Parameters: p = [u, dudx, dudy, v, dvdx, dvdy]
+
+    Args:
+        ref_bcoef: Reference image B-spline coefficients
+        cur_bcoef: Current image B-spline coefficients
+        border: Border padding
+        x, y: Subset center coordinates (in original image)
+        radius: Subset radius
+        u_init, v_init: Initial displacement guess
+        dudx_init, dudy_init, dvdx_init, dvdy_init: Initial strain guess
+        cutoff_diffnorm: Convergence threshold
+        cutoff_iteration: Maximum iterations
+
+    Returns:
+        Tuple of (u, v, dudx, dudy, dvdx, dvdy, correlation_coefficient, converged, iterations)
+    """
+    size = 2 * radius + 1
+    h_ref, w_ref = ref_bcoef.shape
+    h_cur, w_cur = cur_bcoef.shape
+
+    # Arrays for reference subset
+    ref_subset = np.empty((size, size), dtype=np.float64)
+    ref_dx = np.empty((size, size), dtype=np.float64)
+    ref_dy = np.empty((size, size), dtype=np.float64)
+    # Store local coordinates for Hessian computation
+    dx_arr = np.empty((size, size), dtype=np.float64)
+    dy_arr = np.empty((size, size), dtype=np.float64)
+    mask = np.ones((size, size), dtype=np.bool_)
+
+    valid_count = 0
+
+    # Get reference subset with gradients
+    for j in range(size):
+        for i in range(size):
+            dx = float(i - radius)
+            dy = float(j - radius)
+            dx_arr[j, i] = dx
+            dy_arr[j, i] = dy
+
+            px = float(x) + dx + border
+            py = float(y) + dy + border
+
+            if px < 2.0 or px >= w_ref - 3.0 or py < 2.0 or py >= h_ref - 3.0:
+                mask[j, i] = False
+                ref_subset[j, i] = 0.0
+                ref_dx[j, i] = 0.0
+                ref_dy[j, i] = 0.0
+                continue
+
+            val, gx, gy = _bspline_interp_with_grad(px, py, ref_bcoef)
+
+            if np.isnan(val):
+                mask[j, i] = False
+                ref_subset[j, i] = 0.0
+                ref_dx[j, i] = 0.0
+                ref_dy[j, i] = 0.0
+                continue
+
+            ref_subset[j, i] = val
+            ref_dx[j, i] = gx
+            ref_dy[j, i] = gy
+            valid_count += 1
+
+    # Need minimum valid pixels
+    if valid_count < 20:
+        return np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, False, 0
+
+    # Reference subset statistics
+    ref_mean = _masked_mean(ref_subset, mask)
+    ref_centered = ref_subset - ref_mean
+    ref_norm = _masked_norm(ref_centered, mask)
+
+    if ref_norm < 1e-10:
+        return np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, False, 0
+
+    # Normalize gradients
+    grad_x_norm = ref_dx / ref_norm
+    grad_y_norm = ref_dy / ref_norm
+
+    # Precompute Hessian matrix (6x6 for affine)
+    # Parameters: [u, dudx, dudy, v, dvdx, dvdy]
+    # Steepest descent images:
+    # SD[0] = grad_x * 1 = grad_x (for u)
+    # SD[1] = grad_x * dx (for dudx)
+    # SD[2] = grad_x * dy (for dudy)
+    # SD[3] = grad_y * 1 = grad_y (for v)
+    # SD[4] = grad_y * dx (for dvdx)
+    # SD[5] = grad_y * dy (for dvdy)
+
+    H = np.zeros((6, 6), dtype=np.float64)
+
+    for j in range(size):
+        for i in range(size):
+            if not mask[j, i]:
+                continue
+
+            gx = grad_x_norm[j, i]
+            gy = grad_y_norm[j, i]
+            dx = dx_arr[j, i]
+            dy = dy_arr[j, i]
+
+            # Steepest descent images for this pixel
+            sd = np.empty(6, dtype=np.float64)
+            sd[0] = gx          # u
+            sd[1] = gx * dx     # dudx
+            sd[2] = gx * dy     # dudy
+            sd[3] = gy          # v
+            sd[4] = gy * dx     # dvdx
+            sd[5] = gy * dy     # dvdy
+
+            # Add outer product to Hessian
+            for k in range(6):
+                for l in range(6):
+                    H[k, l] += sd[k] * sd[l]
+
+    # Reference normalized
+    ref_normalized = ref_centered / ref_norm
+
+    # Initialize parameters
+    u = u_init
+    dudx = dudx_init
+    dudy = dudy_init
+    v = v_init
+    dvdx = dvdx_init
+    dvdy = dvdy_init
+
+    converged = False
+    final_iteration = 0
+
+    for iteration in range(cutoff_iteration):
+        final_iteration = iteration + 1
+
+        # Get current subset at warped location
+        cur_subset = np.empty((size, size), dtype=np.float64)
+        all_valid = True
+
+        for j in range(size):
+            for i in range(size):
+                if not mask[j, i]:
+                    cur_subset[j, i] = 0.0
+                    continue
+
+                dx = dx_arr[j, i]
+                dy = dy_arr[j, i]
+
+                # First-order affine warp
+                wx = float(x) + dx + u + dudx * dx + dudy * dy + border
+                wy = float(y) + dy + v + dvdx * dx + dvdy * dy + border
+
+                if wx < 2.0 or wx >= w_cur - 3.0 or wy < 2.0 or wy >= h_cur - 3.0:
+                    all_valid = False
+                    break
+
+                val = _bspline_interp(wx, wy, cur_bcoef)
+
+                if np.isnan(val):
+                    all_valid = False
+                    break
+
+                cur_subset[j, i] = val
+
+            if not all_valid:
+                break
+
+        if not all_valid:
+            break
+
+        # Current subset statistics
+        cur_mean = _masked_mean(cur_subset, mask)
+        cur_centered = cur_subset - cur_mean
+        cur_norm = _masked_norm(cur_centered, mask)
+
+        if cur_norm < 1e-10:
+            break
+
+        cur_normalized = cur_centered / cur_norm
+
+        # Error image
+        error = ref_normalized - cur_normalized
+
+        # Compute gradient vector
+        b = np.zeros(6, dtype=np.float64)
+        for j in range(size):
+            for i in range(size):
+                if not mask[j, i]:
+                    continue
+
+                gx = grad_x_norm[j, i]
+                gy = grad_y_norm[j, i]
+                dx = dx_arr[j, i]
+                dy = dy_arr[j, i]
+                err = error[j, i]
+
+                b[0] += gx * err           # u
+                b[1] += gx * dx * err      # dudx
+                b[2] += gx * dy * err      # dudy
+                b[3] += gy * err           # v
+                b[4] += gy * dx * err      # dvdx
+                b[5] += gy * dy * err      # dvdy
+
+        # Solve for update
+        dp, success = _solve_6x6(H, b)
+        if not success:
+            break
+
+        # Inverse compositional update
+        # For IC, we need to invert the warp update and compose
+        # For small updates, this simplifies to additive update
+        u += dp[0]
+        dudx += dp[1]
+        dudy += dp[2]
+        v += dp[3]
+        dvdx += dp[4]
+        dvdy += dp[5]
+
+        # Check convergence (use displacement components primarily)
+        diffnorm = np.sqrt(dp[0] * dp[0] + dp[3] * dp[3])
+        if diffnorm < cutoff_diffnorm:
+            converged = True
+            break
+
+    # Compute final correlation coefficient
+    cur_subset = np.empty((size, size), dtype=np.float64)
+    all_valid = True
+
+    for j in range(size):
+        for i in range(size):
+            if not mask[j, i]:
+                cur_subset[j, i] = 0.0
+                continue
+
+            dx = dx_arr[j, i]
+            dy = dy_arr[j, i]
+
+            wx = float(x) + dx + u + dudx * dx + dudy * dy + border
+            wy = float(y) + dy + v + dvdx * dx + dvdy * dy + border
+
+            if wx < 2.0 or wx >= w_cur - 3.0 or wy < 2.0 or wy >= h_cur - 3.0:
+                all_valid = False
+                break
+
+            val = _bspline_interp(wx, wy, cur_bcoef)
+
+            if np.isnan(val):
+                all_valid = False
+                break
+
+            cur_subset[j, i] = val
+
+        if not all_valid:
+            break
+
+    if not all_valid:
+        return np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, False, final_iteration
+
+    cur_mean = _masked_mean(cur_subset, mask)
+    cur_centered = cur_subset - cur_mean
+    cur_norm = _masked_norm(cur_centered, mask)
+
+    if cur_norm < 1e-10:
+        return np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, False, final_iteration
+
+    ncc = _compute_ncc(ref_centered, cur_centered, ref_norm, cur_norm, mask)
+
+    return u, v, dudx, dudy, dvdx, dvdy, ncc, converged, final_iteration
+
+
 # Alias for backwards compatibility
-_ic_gn_first_order = _ic_gn_translation
+_ic_gn_first_order = _ic_gn_affine
 _ic_gn_single_point = _ic_gn_translation
 
 
@@ -607,13 +950,18 @@ def _process_points_parallel(
     points_y: NDArray[np.int32],
     u_init: NDArray[np.float64],
     v_init: NDArray[np.float64],
+    dudx_init: NDArray[np.float64],
+    dudy_init: NDArray[np.float64],
+    dvdx_init: NDArray[np.float64],
+    dvdy_init: NDArray[np.float64],
     radius: int,
     cutoff_diffnorm: float,
     cutoff_iteration: int,
 ) -> Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64],
-           NDArray[np.bool_], NDArray[np.int32]]:
+           NDArray[np.float64], NDArray[np.float64], NDArray[np.float64],
+           NDArray[np.float64], NDArray[np.bool_], NDArray[np.int32]]:
     """
-    Process multiple points in parallel.
+    Process multiple points in parallel using affine warp model.
 
     Args:
         ref_bcoef: Reference B-spline coefficients
@@ -621,36 +969,47 @@ def _process_points_parallel(
         border: Border size
         points_x, points_y: Point coordinates
         u_init, v_init: Initial displacement guesses
+        dudx_init, dudy_init, dvdx_init, dvdy_init: Initial strain guesses
         radius: Subset radius
         cutoff_diffnorm: Convergence threshold
         cutoff_iteration: Maximum iterations
 
     Returns:
-        Tuple of (u, v, corrcoef, converged, iterations) arrays
+        Tuple of (u, v, dudx, dudy, dvdx, dvdy, corrcoef, converged, iterations) arrays
     """
     n_points = len(points_x)
 
     u_out = np.empty(n_points, dtype=np.float64)
     v_out = np.empty(n_points, dtype=np.float64)
+    dudx_out = np.empty(n_points, dtype=np.float64)
+    dudy_out = np.empty(n_points, dtype=np.float64)
+    dvdx_out = np.empty(n_points, dtype=np.float64)
+    dvdy_out = np.empty(n_points, dtype=np.float64)
     cc_out = np.empty(n_points, dtype=np.float64)
     conv_out = np.empty(n_points, dtype=np.bool_)
     iter_out = np.empty(n_points, dtype=np.int32)
 
     for idx in prange(n_points):
-        u, v, cc, conv, n_iter = _ic_gn_translation(
+        u, v, dudx, dudy, dvdx, dvdy, cc, conv, n_iter = _ic_gn_affine(
             ref_bcoef, cur_bcoef, border,
             points_x[idx], points_y[idx], radius,
             u_init[idx], v_init[idx],
+            dudx_init[idx], dudy_init[idx],
+            dvdx_init[idx], dvdy_init[idx],
             cutoff_diffnorm, cutoff_iteration,
         )
 
         u_out[idx] = u
         v_out[idx] = v
+        dudx_out[idx] = dudx
+        dudy_out[idx] = dudy
+        dvdx_out[idx] = dvdx
+        dvdy_out[idx] = dvdy
         cc_out[idx] = cc
         conv_out[idx] = conv
         iter_out[idx] = n_iter
 
-    return u_out, v_out, cc_out, conv_out, iter_out
+    return u_out, v_out, dudx_out, dudy_out, dvdx_out, dvdy_out, cc_out, conv_out, iter_out
 
 
 # =============================================================================
@@ -823,7 +1182,8 @@ class DICAnalysis:
         """
         Process a single region using flood-fill from seed.
 
-        Uses parallel batch processing when possible.
+        Uses 6-parameter affine model with strain propagation for accurate
+        displacement field estimation in samples with strain.
         """
         radius = self.params.radius
         cutoff_diffnorm = self.params.cutoff_diffnorm
@@ -841,8 +1201,9 @@ class DICAnalysis:
         out_h, out_w = u_plot.shape
 
         # Queue for flood-fill processing
-        # Format: (x, y, u_guess, v_guess)
-        queue = deque([(seed.x, seed.y, seed.u, seed.v)])
+        # Format: (x, y, u_guess, v_guess, dudx, dudy, dvdx, dvdy)
+        # Initialize with seed and zero strain
+        queue = deque([(seed.x, seed.y, seed.u, seed.v, 0.0, 0.0, 0.0, 0.0)])
         processed = set()
         points_processed = 0
 
@@ -859,6 +1220,10 @@ class DICAnalysis:
         batch_points_y = []
         batch_u_init = []
         batch_v_init = []
+        batch_dudx_init = []
+        batch_dudy_init = []
+        batch_dvdx_init = []
+        batch_dvdy_init = []
         batch_ox = []
         batch_oy = []
 
@@ -874,11 +1239,16 @@ class DICAnalysis:
             py = np.array(batch_points_y, dtype=np.int32)
             ui = np.array(batch_u_init, dtype=np.float64)
             vi = np.array(batch_v_init, dtype=np.float64)
+            dudxi = np.array(batch_dudx_init, dtype=np.float64)
+            dudyi = np.array(batch_dudy_init, dtype=np.float64)
+            dvdxi = np.array(batch_dvdx_init, dtype=np.float64)
+            dvdyi = np.array(batch_dvdy_init, dtype=np.float64)
 
-            # Process in parallel
-            u_res, v_res, cc_res, conv_res, iter_res = _process_points_parallel(
+            # Process in parallel with affine model
+            (u_res, v_res, dudx_res, dudy_res, dvdx_res, dvdy_res,
+             cc_res, conv_res, iter_res) = _process_points_parallel(
                 ref_bcoef, cur_bcoef, border,
-                px, py, ui, vi,
+                px, py, ui, vi, dudxi, dudyi, dvdxi, dvdyi,
                 radius, cutoff_diffnorm, cutoff_iteration,
             )
 
@@ -901,20 +1271,40 @@ class DICAnalysis:
                     y = batch_points_y[idx]
 
                     if cc_res[idx] >= min_cc_for_propagation:
-                        next_u, next_v = u_res[idx], v_res[idx]
-                    else:
-                        next_u, next_v = seed.u, seed.v
+                        # Use strain parameters to predict displacement at neighbors
+                        # This greatly improves convergence for samples with strain
+                        cur_u = u_res[idx]
+                        cur_v = v_res[idx]
+                        cur_dudx = dudx_res[idx]
+                        cur_dudy = dudy_res[idx]
+                        cur_dvdx = dvdx_res[idx]
+                        cur_dvdy = dvdy_res[idx]
 
-                    for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
-                        nx, ny = x + dx, y + dy
-                        if (nx, ny) not in processed:
-                            queue.append((nx, ny, next_u, next_v))
+                        # Propagate to neighbors with strain-based prediction
+                        for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
+                            nx, ny = x + dx, y + dy
+                            if (nx, ny) not in processed:
+                                # Predict displacement at neighbor using strain
+                                next_u = cur_u + cur_dudx * dx + cur_dudy * dy
+                                next_v = cur_v + cur_dvdx * dx + cur_dvdy * dy
+                                queue.append((nx, ny, next_u, next_v,
+                                             cur_dudx, cur_dudy, cur_dvdx, cur_dvdy))
+                    else:
+                        # Fall back to seed displacement
+                        for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
+                            nx, ny = x + dx, y + dy
+                            if (nx, ny) not in processed:
+                                queue.append((nx, ny, seed.u, seed.v, 0.0, 0.0, 0.0, 0.0))
 
             # Clear batch
             batch_points_x.clear()
             batch_points_y.clear()
             batch_u_init.clear()
             batch_v_init.clear()
+            batch_dudx_init.clear()
+            batch_dudy_init.clear()
+            batch_dvdx_init.clear()
+            batch_dvdy_init.clear()
             batch_ox.clear()
             batch_oy.clear()
 
@@ -931,7 +1321,7 @@ class DICAnalysis:
         while queue or batch_points_x:
             # Fill batch from queue
             while queue and len(batch_points_x) < batch_size:
-                x, y, u_guess, v_guess = queue.popleft()
+                x, y, u_guess, v_guess, dudx_g, dudy_g, dvdx_g, dvdy_g = queue.popleft()
 
                 # Convert to output coordinates
                 ox, oy = x // step, y // step
@@ -953,6 +1343,10 @@ class DICAnalysis:
                 batch_points_y.append(y)
                 batch_u_init.append(u_guess)
                 batch_v_init.append(v_guess)
+                batch_dudx_init.append(dudx_g)
+                batch_dudy_init.append(dudy_g)
+                batch_dvdx_init.append(dvdx_g)
+                batch_dvdy_init.append(dvdy_g)
                 batch_ox.append(ox)
                 batch_oy.append(oy)
 
