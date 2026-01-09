@@ -1434,6 +1434,7 @@ class DICAnalysis:
         1. Priority queue (heapq) - highest correlation processed first
         2. 6-parameter affine model with strain-based initial guess propagation
         3. Displacement jump cutoff (spacing+1 pixels)
+        4. MATLAB-identical neighbor order: top, right, bottom, left
         """
         radius = self.params.radius
         cutoff_diffnorm = self.params.cutoff_diffnorm
@@ -1447,12 +1448,11 @@ class DICAnalysis:
 
         # DEBUG: Print seed and parameters
         print(f"\n{'='*60}")
-        print(f"DEBUG _process_region_optimized (MATLAB-style):")
+        print(f"DEBUG _process_region_optimized (MATLAB-style v2):")
         print(f"  Seed position: ({seed.x}, {seed.y})")
         print(f"  Seed displacement: u={seed.u:.4f}, v={seed.v:.4f}")
         print(f"  Radius: {radius}, Step: {step}")
         print(f"  Displacement cutoff: {cutoff_disp}")
-        print(f"  Using previous result: {use_prev_result}")
         print(f"{'='*60}")
 
         # Get region data for in-region checking
@@ -1461,10 +1461,6 @@ class DICAnalysis:
         nodelist = np.asarray(region.nodelist, dtype=np.int32)
 
         out_h, out_w = u_plot.shape
-
-        # Priority queue: (neg_cc, x, y, u, v, dudx, dudy, dvdx, dvdy, parent_x, parent_y)
-        # Using negative CC because heapq is a min-heap, and we want highest CC first
-        # MATLAB processes highest correlation first to propagate good results
 
         # Initialize seed - first compute its affine parameters
         seed_u, seed_v, seed_dudx, seed_dudy, seed_dvdx, seed_dvdy, seed_cc, seed_conv, seed_iter = _ic_gn_affine(
@@ -1482,13 +1478,17 @@ class DICAnalysis:
         print(f"  Seed IC-GN result: u={seed_u:.4f}, v={seed_v:.4f}, CC={seed_cc:.4f}")
         print(f"  Seed strain: dudx={seed_dudx:.6f}, dudy={seed_dudy:.6f}, dvdx={seed_dvdx:.6f}, dvdy={seed_dvdy:.6f}")
 
-        # Priority queue entry: (-cc, x, y, u, v, dudx, dudy, dvdx, dvdy, parent_x, parent_y)
+        # Priority queue: (neg_cc, insertion_order, x, y, u, v, dudx, dudy, dvdx, dvdy)
+        # Using negative CC because heapq is a min-heap, and we want highest CC first
+        # insertion_order as tie-breaker for stable ordering (like MATLAB)
+        insertion_counter = 0
         heap = []
-        heapq.heappush(heap, (-seed_cc, seed.x, seed.y, seed_u, seed_v,
-                              seed_dudx, seed_dudy, seed_dvdx, seed_dvdy,
-                              seed.x, seed.y))
+        heapq.heappush(heap, (-seed_cc, insertion_counter, seed.x, seed.y, seed_u, seed_v,
+                              seed_dudx, seed_dudy, seed_dvdx, seed_dvdy))
+        insertion_counter += 1
 
-        # Track which points have been calculated (not just added to queue)
+        # Track which points have been calculated (MATLAB: plot_calcpoints)
+        # Mark AFTER calculation, not before (like MATLAB)
         calc_points = np.zeros((out_h, out_w), dtype=np.bool_)
 
         # Mark seed as calculated
@@ -1504,7 +1504,7 @@ class DICAnalysis:
 
         while heap:
             # Pop point with highest correlation (lowest negative CC)
-            neg_cc, x, y, u, v, dudx, dudy, dvdx, dvdy, parent_x, parent_y = heapq.heappop(heap)
+            neg_cc, _, x, y, u, v, dudx, dudy, dvdx, dvdy = heapq.heappop(heap)
             cc = -neg_cc
 
             # Convert to output coordinates
@@ -1529,8 +1529,9 @@ class DICAnalysis:
                     f"Processing... {points_processed:,} points ({current_percent}%)"
                 )
 
-            # Analyze four neighbors
-            for dx_step, dy_step in [(-step, 0), (step, 0), (0, -step), (0, step)]:
+            # Analyze four neighbors - MATLAB order: top, right, bottom, left
+            # MATLAB: y-step, x+step, y+step, x-step
+            for dx_step, dy_step in [(0, -step), (step, 0), (0, step), (-step, 0)]:
                 nx, ny = x + dx_step, y + dy_step
 
                 # Convert to output coordinates
@@ -1540,15 +1541,14 @@ class DICAnalysis:
                 if not (0 <= ny_out < out_h and 0 <= nx_out < out_w):
                     continue
 
-                # Skip if already calculated
+                # Skip if already calculated (check BEFORE calculation, like MATLAB)
                 if calc_points[ny_out, nx_out]:
                     continue
 
-                # Mark as calculated (to prevent multiple entries in queue)
-                calc_points[ny_out, nx_out] = True
-
-                # Check if point is in region
+                # Check if point is in region BEFORE marking as calculated
                 if not _check_point_in_region(nx, ny, leftbound, noderange, nodelist):
+                    # Still mark as calculated to prevent re-checking
+                    calc_points[ny_out, nx_out] = True
                     continue
 
                 # MATLAB-style initial guess using strain propagation:
@@ -1578,22 +1578,26 @@ class DICAnalysis:
                     cutoff_diffnorm, cutoff_iteration,
                 )
 
+                # Mark as calculated AFTER calculation (like MATLAB)
+                calc_points[ny_out, nx_out] = True
+
                 # Check if result is valid
                 if np.isnan(new_cc):
                     continue
 
-                # MATLAB cutoff: correlation must be reasonable (NCC > 0.5 means ZNSSD < 1.0)
-                if new_cc < 0.5:
+                # MATLAB cutoff: correlation coefficient (ZNSSD < 2.0 means NCC > 0)
+                # Being more lenient like MATLAB
+                if new_cc < 0.0:
                     continue
 
                 # MATLAB cutoff: displacement jump must be less than step
                 if abs(u_init - new_u) >= cutoff_disp or abs(v_init - new_v) >= cutoff_disp:
                     continue
 
-                # Add to priority queue
-                heapq.heappush(heap, (-new_cc, nx, ny, new_u, new_v,
-                                      new_dudx, new_dudy, new_dvdx, new_dvdy,
-                                      x, y))
+                # Add to priority queue with insertion order for stable sorting
+                heapq.heappush(heap, (-new_cc, insertion_counter, nx, ny, new_u, new_v,
+                                      new_dudx, new_dudy, new_dvdx, new_dvdy))
+                insertion_counter += 1
 
         return points_processed
 
