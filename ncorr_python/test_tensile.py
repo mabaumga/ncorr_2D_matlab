@@ -84,31 +84,37 @@ def create_deformed_image_tensile(ref_image, strain_x=0.01):
     return deformed.astype(np.uint8), u_shift
 
 
-def create_deformed_image_gradient(ref_image, strain_x=0.01):
+def create_deformed_image_symmetric(ref_image, strain_x=0.01, strain_y=0.0):
     """
-    Create a deformed image simulating a tensile test with displacement gradient.
+    Create a deformed image with SYMMETRIC strain around the center.
 
-    The left edge is fixed (u=0), and displacement increases linearly
-    toward the right edge.
+    This simulates a tensile test where:
+    - The center of the image has zero displacement (u=0, v=0)
+    - Displacement increases linearly away from the center
+    - u(x) = strain_x * (x - center_x)
+    - v(y) = strain_y * (y - center_y)
 
     DIC convention: point at (x,y) in reference moves to (x+u, y+v) in current.
     """
     height, width = ref_image.shape
+    center_x = width / 2
+    center_y = height / 2
 
     # Create coordinate grid
     y_coords, x_coords = np.meshgrid(np.arange(height), np.arange(width), indexing='ij')
 
-    # Displacement field: u(x) = strain_x * x
-    # At a point x in the reference, the displacement is u = strain_x * x
-    # That point appears at x_new = x + u = x + strain_x * x = x*(1 + strain_x) in current
+    # For symmetric deformation around center:
+    # A point at (x, y) in reference moves to:
+    #   x_new = center_x + (x - center_x) * (1 + strain_x)
+    #   y_new = center_y + (y - center_y) * (1 + strain_y)
     #
-    # To create the current image from reference:
-    # current(x_new) = ref(x) where x_new = x*(1 + strain_x)
-    # So: current(x_new) = ref(x_new / (1 + strain_x))
-    #
-    # For each pixel x in current image, find where it came from in reference
-    x_source = x_coords / (1 + strain_x)
-    y_source = y_coords.astype(np.float64)
+    # To create current image from reference (inverse mapping):
+    # current(x_new, y_new) = ref(x, y)
+    # where x = center_x + (x_new - center_x) / (1 + strain_x)
+    #       y = center_y + (y_new - center_y) / (1 + strain_y)
+
+    x_source = center_x + (x_coords - center_x) / (1 + strain_x)
+    y_source = center_y + (y_coords - center_y) / (1 + strain_y)
 
     # Interpolate
     deformed = map_coordinates(
@@ -118,7 +124,7 @@ def create_deformed_image_gradient(ref_image, strain_x=0.01):
         mode='nearest'
     )
 
-    return deformed.astype(np.uint8), strain_x
+    return deformed.astype(np.uint8), strain_x, strain_y
 
 
 def main():
@@ -129,23 +135,27 @@ def main():
 
     ref_image = create_synthetic_speckle(width, height)
 
-    # Test with HORIZONTAL strain (tensile test in x-direction)
-    # This creates a displacement field: u(x) = strain * x, v = 0
-    strain_x = 0.01  # 1% strain
-    cur_image, _ = create_deformed_image_gradient(ref_image, strain_x)
+    # Test with SYMMETRIC strain around center (like user's MATLAB images)
+    # This creates a displacement field where u=0 at center
+    strain_x = 0.01  # 1% strain in x-direction
+    strain_y = -0.003  # Small negative strain in y (Poisson effect)
 
-    # The current image will be the same size as reference
-    # Displacement at center (x=400): u = strain * 400 / (1+strain) ≈ 3.96 pixels
-    u_at_center = strain_x * 400 / (1 + strain_x)
+    cur_image, _, _ = create_deformed_image_symmetric(ref_image, strain_x, strain_y)
 
-    print(f"Applied strain: {strain_x*100:.1f}%")
-    print(f"Expected displacement at center (x=400): u={u_at_center:.2f} pixels")
+    # Expected displacement:
+    # At center (x=400, y=100): u=0, v=0
+    # At x=404 (one step right): u = strain_x * 4 = 0.04 pixels
+    # At x=0: u = strain_x * (0 - 400) = -4 pixels
+    # At x=800: u = strain_x * (800 - 400) = +4 pixels
+
+    print(f"Applied SYMMETRIC strain around center:")
+    print(f"  strain_x = {strain_x*100:.2f}%")
+    print(f"  strain_y = {strain_y*100:.2f}%")
+    print(f"Expected displacement at center: u=0, v=0")
+    print(f"Expected displacement at edges: u=±{abs(strain_x * 400):.1f} pixels")
     print(f"Expected strain gradient: du/dx = {strain_x:.4f}")
 
-    # For correct DIC measurement, the displacement at x is:
-    # u(x) = strain * x / (1 + strain) ≈ strain * x for small strain
-
-    u_shift = u_at_center
+    u_shift = 0.0  # At center
     v_shift = 0.0
 
     # Save images for inspection
