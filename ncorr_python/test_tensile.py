@@ -129,12 +129,24 @@ def main():
 
     ref_image = create_synthetic_speckle(width, height)
 
-    # Test with VERTICAL displacement (like user's case: v≈-37 to -41)
-    u_shift = 0.0
-    v_shift = -40.0  # Large negative v displacement
-    cur_image = shift(ref_image.astype(np.float64), [v_shift, u_shift], mode='nearest').astype(np.uint8)
-    print(f"Applied uniform displacement: u={u_shift:.2f}, v={v_shift:.2f} pixels")
-    strain_x = 0  # For compatibility with seed setup below
+    # Test with HORIZONTAL strain (tensile test in x-direction)
+    # This creates a displacement field: u(x) = strain * x, v = 0
+    strain_x = 0.01  # 1% strain
+    cur_image, _ = create_deformed_image_gradient(ref_image, strain_x)
+
+    # The current image will be the same size as reference
+    # Displacement at center (x=400): u = strain * 400 / (1+strain) ≈ 3.96 pixels
+    u_at_center = strain_x * 400 / (1 + strain_x)
+
+    print(f"Applied strain: {strain_x*100:.1f}%")
+    print(f"Expected displacement at center (x=400): u={u_at_center:.2f} pixels")
+    print(f"Expected strain gradient: du/dx = {strain_x:.4f}")
+
+    # For correct DIC measurement, the displacement at x is:
+    # u(x) = strain * x / (1 + strain) ≈ strain * x for small strain
+
+    u_shift = u_at_center
+    v_shift = 0.0
 
     # Save images for inspection
     Image.fromarray(ref_image).save('/tmp/ref_tensile.png')
@@ -171,18 +183,6 @@ def main():
     )
 
     print(f"\nDIC parameters: radius={radius}, spacing={spacing}, step={step}")
-
-    # Calculate expected boundary constraints
-    # For the warped subset to be valid, we need:
-    #   y_min_warped = y - radius + v + border >= 2
-    #   y_max_warped = y + radius + v + border < h - 3
-    # This gives constraints on valid y range in reference image
-    if v_shift < 0:
-        y_min_valid = max(border, 2 + radius - v_shift - border)
-        y_max_valid = min(height - border - 1, height + border - 3 - radius - v_shift - border)
-        print(f"\nBoundary constraints (with v={v_shift:.1f}, radius={radius}):")
-        print(f"  Minimum valid y: {y_min_valid:.0f} (subset bottom edge stays in image)")
-        print(f"  Maximum valid y: {y_max_valid:.0f}")
 
     # Create seed at center with CORRECT initial guess
     seed_x = 400
