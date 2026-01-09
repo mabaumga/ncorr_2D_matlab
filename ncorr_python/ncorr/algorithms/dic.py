@@ -1530,13 +1530,33 @@ class DICAnalysis:
                     calc_points[ny_out, nx_out] = True
                     continue
 
-                # Initial guess: just use parent's displacement (no strain prediction)
+                # Initial guess: use MEDIAN of all calculated neighbors (more robust)
+                # This prevents single outliers from propagating errors
                 if use_prev_result and prev_roi[ny_out, nx_out] and not np.isnan(prev_u[ny_out, nx_out]):
                     u_init = prev_u[ny_out, nx_out]
                     v_init = prev_v[ny_out, nx_out]
                 else:
-                    u_init = u
-                    v_init = v
+                    # Collect all calculated neighbors' displacements
+                    neighbor_u = []
+                    neighbor_v = []
+                    for nox, noy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        nnx, nny = nx_out + nox, ny_out + noy
+                        if 0 <= nny < out_h and 0 <= nnx < out_w:
+                            if roi_plot[nny, nnx] and not np.isnan(u_plot[nny, nnx]):
+                                neighbor_u.append(u_plot[nny, nnx])
+                                neighbor_v.append(v_plot[nny, nnx])
+
+                    if len(neighbor_u) >= 2:
+                        # Use median of neighbors (robust against outliers)
+                        u_init = float(np.median(neighbor_u))
+                        v_init = float(np.median(neighbor_v))
+                    elif len(neighbor_u) == 1:
+                        u_init = neighbor_u[0]
+                        v_init = neighbor_v[0]
+                    else:
+                        # Fallback to parent
+                        u_init = u
+                        v_init = v
 
                 # Run IC-GN with TRANSLATION model
                 new_u, new_v, new_cc, new_conv, new_iter = _ic_gn_translation(
@@ -1553,6 +1573,26 @@ class DICAnalysis:
 
                 if new_cc < 0.0:
                     continue
+
+                # Consistency check: if result differs significantly from neighbors,
+                # try again with median of neighbors as initial guess
+                if len(neighbor_u) >= 2:
+                    median_u = float(np.median(neighbor_u))
+                    median_v = float(np.median(neighbor_v))
+
+                    # If result differs by more than 0.3 pixels from median, retry
+                    if abs(new_u - median_u) > 0.3 or abs(new_v - median_v) > 0.3:
+                        retry_u, retry_v, retry_cc, _, _ = _ic_gn_translation(
+                            ref_bcoef, cur_bcoef, border,
+                            nx, ny, radius,
+                            median_u, median_v,
+                            cutoff_diffnorm, cutoff_iteration,
+                        )
+
+                        # Keep result closer to median if CC is similar (within 0.01)
+                        if not np.isnan(retry_cc) and retry_cc > new_cc - 0.01:
+                            if abs(retry_u - median_u) < abs(new_u - median_u):
+                                new_u, new_v, new_cc = retry_u, retry_v, retry_cc
 
                 # Displacement jump cutoff
                 if abs(u_init - new_u) >= cutoff_disp or abs(v_init - new_v) >= cutoff_disp:
