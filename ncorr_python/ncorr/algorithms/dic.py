@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Callable
 from collections import deque
+import heapq
 
 import numpy as np
 from numpy.typing import NDArray
@@ -1429,8 +1430,10 @@ class DICAnalysis:
         """
         Process a single region using flood-fill from seed.
 
-        Uses 6-parameter affine model with local NCC search for robust convergence.
-        If prev_u/prev_v are provided (from previous frame), uses them as initial guesses.
+        MATLAB-compatible implementation using:
+        1. Priority queue (heapq) - highest correlation processed first
+        2. 6-parameter affine model with strain-based initial guess propagation
+        3. Displacement jump cutoff (spacing+1 pixels)
         """
         radius = self.params.radius
         cutoff_diffnorm = self.params.cutoff_diffnorm
@@ -1439,179 +1442,82 @@ class DICAnalysis:
         # Check if we have previous results to use as initial guesses
         use_prev_result = (prev_u is not None and prev_v is not None and prev_roi is not None)
 
+        # MATLAB cutoffs
+        cutoff_disp = float(step)  # Displacement jump cutoff (spacing+1 in MATLAB)
+
         # DEBUG: Print seed and parameters
         print(f"\n{'='*60}")
-        print(f"DEBUG _process_region_optimized:")
+        print(f"DEBUG _process_region_optimized (MATLAB-style):")
         print(f"  Seed position: ({seed.x}, {seed.y})")
         print(f"  Seed displacement: u={seed.u:.4f}, v={seed.v:.4f}")
         print(f"  Radius: {radius}, Step: {step}")
-        print(f"  Border: {border}")
+        print(f"  Displacement cutoff: {cutoff_disp}")
         print(f"  Using previous result: {use_prev_result}")
-        print(f"  cutoff_diffnorm: {cutoff_diffnorm}, cutoff_iteration: {cutoff_iteration}")
-
-        # DEBUG: Test IC-GN directly at seed point
-        print(f"\nDEBUG: Testing IC-GN directly at seed point...")
-        test_u, test_v, test_cc, test_conv, test_iter = _ic_gn_translation(
-            ref_bcoef, cur_bcoef, border,
-            seed.x, seed.y, radius,
-            seed.u, seed.v,
-            cutoff_diffnorm, cutoff_iteration,
-        )
-        print(f"  Direct IC-GN result: u={test_u:.4f}, v={test_v:.4f}, CC={test_cc:.4f}, conv={test_conv}, iter={test_iter}")
-
-        # DEBUG: Also test with zero initial guess
-        print(f"\nDEBUG: Testing IC-GN with zero initial guess...")
-        test_u0, test_v0, test_cc0, test_conv0, test_iter0 = _ic_gn_translation(
-            ref_bcoef, cur_bcoef, border,
-            seed.x, seed.y, radius,
-            0.0, 0.0,
-            cutoff_diffnorm, cutoff_iteration,
-        )
-        print(f"  Zero-init IC-GN result: u={test_u0:.4f}, v={test_v0:.4f}, CC={test_cc0:.4f}, conv={test_conv0}, iter={test_iter0}")
         print(f"{'='*60}")
-
-        # Minimum correlation to propagate result as initial guess
-        min_cc_for_propagation = 0.9
 
         # Get region data for in-region checking
         leftbound = region.leftbound
         noderange = np.asarray(region.noderange, dtype=np.int32)
         nodelist = np.asarray(region.nodelist, dtype=np.int32)
 
-        # First, collect all points in region
         out_h, out_w = u_plot.shape
 
-        # Queue for flood-fill processing
-        # Format: (x, y, u_guess, v_guess)
-        queue = deque([(seed.x, seed.y, seed.u, seed.v)])
-        processed = set()
+        # Priority queue: (neg_cc, x, y, u, v, dudx, dudy, dvdx, dvdy, parent_x, parent_y)
+        # Using negative CC because heapq is a min-heap, and we want highest CC first
+        # MATLAB processes highest correlation first to propagate good results
+
+        # Initialize seed - first compute its affine parameters
+        seed_u, seed_v, seed_dudx, seed_dudy, seed_dvdx, seed_dvdy, seed_cc, seed_conv, seed_iter = _ic_gn_affine(
+            ref_bcoef, cur_bcoef, border,
+            seed.x, seed.y, radius,
+            seed.u, seed.v,
+            0.0, 0.0, 0.0, 0.0,  # Zero strain initial guess
+            cutoff_diffnorm, cutoff_iteration,
+        )
+
+        if np.isnan(seed_cc) or seed_cc < 0.5:
+            print(f"WARNING: Seed failed to converge! CC={seed_cc}")
+            return 0
+
+        print(f"  Seed IC-GN result: u={seed_u:.4f}, v={seed_v:.4f}, CC={seed_cc:.4f}")
+        print(f"  Seed strain: dudx={seed_dudx:.6f}, dudy={seed_dudy:.6f}, dvdx={seed_dvdx:.6f}, dvdy={seed_dvdy:.6f}")
+
+        # Priority queue entry: (-cc, x, y, u, v, dudx, dudy, dvdx, dvdy, parent_x, parent_y)
+        heap = []
+        heapq.heappush(heap, (-seed_cc, seed.x, seed.y, seed_u, seed_v,
+                              seed_dudx, seed_dudy, seed_dvdx, seed_dvdy,
+                              seed.x, seed.y))
+
+        # Track which points have been calculated (not just added to queue)
+        calc_points = np.zeros((out_h, out_w), dtype=np.bool_)
+
+        # Mark seed as calculated
+        ox_seed, oy_seed = seed.x // step, seed.y // step
+        calc_points[oy_seed, ox_seed] = True
+
         points_processed = 0
+        last_progress_percent = -1
 
         # Estimate total points if not provided
         if estimated_points <= 0:
             estimated_points = region.totalpoints // (step * step) if region.totalpoints > 0 else 10000
 
-        # Progress reporting at 1% increments
-        last_progress_percent = -1
+        while heap:
+            # Pop point with highest correlation (lowest negative CC)
+            neg_cc, x, y, u, v, dudx, dudy, dvdx, dvdy, parent_x, parent_y = heapq.heappop(heap)
+            cc = -neg_cc
 
-        # Batch processing parameters - smaller batches for better neighbor consistency
-        batch_size = 100
-        batch_points_x = []
-        batch_points_y = []
-        batch_u_init = []
-        batch_v_init = []
-        batch_ox = []
-        batch_oy = []
+            # Convert to output coordinates
+            ox, oy = x // step, y // step
 
-        debug_batch_count = [0]  # Use list to allow modification in nested function
-
-        def process_batch():
-            """Process accumulated batch of points in parallel using translation model."""
-            nonlocal points_processed, last_progress_percent
-
-            if not batch_points_x:
-                return
-
-            # Convert to arrays
-            px = np.array(batch_points_x, dtype=np.int32)
-            py = np.array(batch_points_y, dtype=np.int32)
-            ui = np.array(batch_u_init, dtype=np.float64)
-            vi = np.array(batch_v_init, dtype=np.float64)
-
-            # DEBUG: Print first batch info
-            if debug_batch_count[0] == 0:
-                print(f"\nDEBUG First batch (Translation model, batch_size={batch_size}):")
-                print(f"  Number of points: {len(px)}")
-                for i in range(min(5, len(px))):
-                    print(f"  Point {i}: ({px[i]}, {py[i]}) init u={ui[i]:.4f}, v={vi[i]:.4f}")
-
-            # Process in parallel with TRANSLATION model (more stable)
-            u_res, v_res, cc_res, conv_res, iter_res = _process_points_parallel_translation(
-                ref_bcoef, cur_bcoef, border,
-                px, py, ui, vi,
-                radius, cutoff_diffnorm, cutoff_iteration,
-            )
-
-            # DEBUG: Print first batch results
-            if debug_batch_count[0] == 0:
-                print(f"\nDEBUG First batch RESULTS (Translation model):")
-                for i in range(min(5, len(px))):
-                    print(f"  Point {i}: u={u_res[i]:.4f}, v={v_res[i]:.4f}, CC={cc_res[i]:.4f}, conv={conv_res[i]}, iter={iter_res[i]}")
-                debug_batch_count[0] += 1
-
-            # Store results and check consistency
-            for idx in range(len(batch_points_x)):
-                ox = batch_ox[idx]
-                oy = batch_oy[idx]
-                x = batch_points_x[idx]
-                y = batch_points_y[idx]
-
-                if np.isnan(u_res[idx]):
-                    continue
-
-                u_result = u_res[idx]
-                v_result = v_res[idx]
-                cc_result = cc_res[idx]
-
-                # Consistency check: compare with already-processed neighbors
-                # If displacement differs too much, re-try with neighbor's value
-                neighbor_offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-                for nox, noy in neighbor_offsets:
-                    nx_out, ny_out = ox + nox, oy + noy
-                    if 0 <= ny_out < out_h and 0 <= nx_out < out_w:
-                        if roi_plot[ny_out, nx_out] and not np.isnan(u_plot[ny_out, nx_out]):
-                            neighbor_u = u_plot[ny_out, nx_out]
-                            neighbor_v = v_plot[ny_out, nx_out]
-
-                            # Check if there's a significant jump (> 0.5 pixel)
-                            du = abs(u_result - neighbor_u)
-                            dv = abs(v_result - neighbor_v)
-
-                            if du > 0.5 or dv > 0.5:
-                                # Re-try IC-GN with neighbor's displacement as initial guess
-                                u_retry, v_retry, cc_retry, _, _ = _ic_gn_translation(
-                                    ref_bcoef, cur_bcoef, border,
-                                    x, y, radius,
-                                    neighbor_u, neighbor_v,
-                                    cutoff_diffnorm, cutoff_iteration,
-                                )
-
-                                # Keep the result with higher correlation
-                                if cc_retry > cc_result:
-                                    u_result = u_retry
-                                    v_result = v_retry
-                                    cc_result = cc_retry
-                                    # Only need one successful retry
-                                    break
-
-                # Store the (possibly corrected) result
-                u_plot[oy, ox] = u_result
-                v_plot[oy, ox] = v_result
-                corrcoef_plot[oy, ox] = cc_result
-                roi_plot[oy, ox] = True
-                converged[oy, ox] = conv_res[idx]
-                iterations[oy, ox] = iter_res[idx]
-                points_processed += 1
-
-                # Add neighbors to queue
-                if cc_result >= min_cc_for_propagation:
-                    for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
-                        nx, ny = x + dx, y + dy
-                        if (nx, ny) not in processed:
-                            queue.append((nx, ny, u_result, v_result))
-                else:
-                    for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
-                        nx, ny = x + dx, y + dy
-                        if (nx, ny) not in processed:
-                            queue.append((nx, ny, seed.u, seed.v))
-
-            # Clear batch
-            batch_points_x.clear()
-            batch_points_y.clear()
-            batch_u_init.clear()
-            batch_v_init.clear()
-            batch_ox.clear()
-            batch_oy.clear()
+            # Store result in output arrays
+            u_plot[oy, ox] = u
+            v_plot[oy, ox] = v
+            corrcoef_plot[oy, ox] = cc
+            roi_plot[oy, ox] = True
+            converged[oy, ox] = True
+            iterations[oy, ox] = 0
+            points_processed += 1
 
             # Progress reporting
             current_percent = int(points_processed * 100 / max(1, estimated_points))
@@ -1620,48 +1526,74 @@ class DICAnalysis:
                 progress = min(0.99, points_processed / max(1, estimated_points))
                 self._report_progress(
                     progress,
-                    f"Processing... {points_processed:,}/{estimated_points:,} points ({current_percent}%)"
+                    f"Processing... {points_processed:,} points ({current_percent}%)"
                 )
 
-        while queue or batch_points_x:
-            # Fill batch from queue
-            while queue and len(batch_points_x) < batch_size:
-                x, y, u_guess, v_guess = queue.popleft()
+            # Analyze four neighbors
+            for dx_step, dy_step in [(-step, 0), (step, 0), (0, -step), (0, step)]:
+                nx, ny = x + dx_step, y + dy_step
 
                 # Convert to output coordinates
-                ox, oy = x // step, y // step
+                nx_out, ny_out = nx // step, ny // step
 
-                if (x, y) in processed:
+                # Skip if outside bounds
+                if not (0 <= ny_out < out_h and 0 <= nx_out < out_w):
                     continue
 
-                if not (0 <= oy < out_h and 0 <= ox < out_w):
+                # Skip if already calculated
+                if calc_points[ny_out, nx_out]:
                     continue
 
-                processed.add((x, y))
+                # Mark as calculated (to prevent multiple entries in queue)
+                calc_points[ny_out, nx_out] = True
 
                 # Check if point is in region
-                if not _check_point_in_region(x, y, leftbound, noderange, nodelist):
+                if not _check_point_in_region(nx, ny, leftbound, noderange, nodelist):
                     continue
 
-                # Use previous result as initial guess if available
-                if use_prev_result and prev_roi[oy, ox] and not np.isnan(prev_u[oy, ox]):
-                    u_init_val = prev_u[oy, ox]
-                    v_init_val = prev_v[oy, ox]
+                # MATLAB-style initial guess using strain propagation:
+                # u_init = u + dudx*(nx - x) + dudy*(ny - y)
+                # v_init = v + dvdx*(nx - x) + dvdy*(ny - y)
+                if use_prev_result and prev_roi[ny_out, nx_out] and not np.isnan(prev_u[ny_out, nx_out]):
+                    u_init = prev_u[ny_out, nx_out]
+                    v_init = prev_v[ny_out, nx_out]
+                    dudx_init, dudy_init, dvdx_init, dvdy_init = 0.0, 0.0, 0.0, 0.0
                 else:
-                    u_init_val = u_guess
-                    v_init_val = v_guess
+                    # Strain-based initial guess prediction (MATLAB-style)
+                    delta_x = float(nx - x)
+                    delta_y = float(ny - y)
+                    u_init = u + dudx * delta_x + dudy * delta_y
+                    v_init = v + dvdx * delta_x + dvdy * delta_y
+                    dudx_init = dudx
+                    dudy_init = dudy
+                    dvdx_init = dvdx
+                    dvdy_init = dvdy
 
-                # Add to batch
-                batch_points_x.append(x)
-                batch_points_y.append(y)
-                batch_u_init.append(u_init_val)
-                batch_v_init.append(v_init_val)
-                batch_ox.append(ox)
-                batch_oy.append(oy)
+                # Run IC-GN with 6-parameter affine model
+                new_u, new_v, new_dudx, new_dudy, new_dvdx, new_dvdy, new_cc, new_conv, new_iter = _ic_gn_affine(
+                    ref_bcoef, cur_bcoef, border,
+                    nx, ny, radius,
+                    u_init, v_init,
+                    dudx_init, dudy_init, dvdx_init, dvdy_init,
+                    cutoff_diffnorm, cutoff_iteration,
+                )
 
-            # Process batch if full or queue is empty
-            if len(batch_points_x) >= batch_size or (not queue and batch_points_x):
-                process_batch()
+                # Check if result is valid
+                if np.isnan(new_cc):
+                    continue
+
+                # MATLAB cutoff: correlation must be reasonable (NCC > 0.5 means ZNSSD < 1.0)
+                if new_cc < 0.5:
+                    continue
+
+                # MATLAB cutoff: displacement jump must be less than step
+                if abs(u_init - new_u) >= cutoff_disp or abs(v_init - new_v) >= cutoff_disp:
+                    continue
+
+                # Add to priority queue
+                heapq.heappush(heap, (-new_cc, nx, ny, new_u, new_v,
+                                      new_dudx, new_dudy, new_dvdx, new_dvdy,
+                                      x, y))
 
         return points_processed
 
