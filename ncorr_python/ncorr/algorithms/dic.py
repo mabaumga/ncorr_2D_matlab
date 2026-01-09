@@ -1432,7 +1432,7 @@ class DICAnalysis:
 
         Hybrid approach:
         1. Priority queue (heapq) - highest correlation processed first (like MATLAB)
-        2. Translation model (2-parameter) for stability
+        2. Affine model (6-parameter) to capture strain/deformation
         3. Displacement jump cutoff (spacing+1 pixels)
         4. MATLAB-identical neighbor order: top, right, bottom, left
         """
@@ -1453,7 +1453,7 @@ class DICAnalysis:
 
         # DEBUG
         print(f"\n{'='*60}")
-        print(f"DEBUG: Hybrid approach (Priority Queue + Translation Model)")
+        print(f"DEBUG: Using AFFINE Model (6 parameters) for strain measurement")
         print(f"  Seed: ({seed.x}, {seed.y}), u={seed.u:.4f}, v={seed.v:.4f}")
         print(f"  Step: {step}, Cutoff: {cutoff_disp}")
         print(f"  Image size: {ref_bcoef.shape}, Border: {border}")
@@ -1468,11 +1468,18 @@ class DICAnalysis:
 
         out_h, out_w = u_plot.shape
 
-        # Initialize seed using TRANSLATION model (more stable)
-        seed_u, seed_v, seed_cc, seed_conv, seed_iter = _ic_gn_translation(
+        # Store strain fields for propagation
+        dudx_field = np.zeros((out_h, out_w), dtype=np.float64)
+        dudy_field = np.zeros((out_h, out_w), dtype=np.float64)
+        dvdx_field = np.zeros((out_h, out_w), dtype=np.float64)
+        dvdy_field = np.zeros((out_h, out_w), dtype=np.float64)
+
+        # Initialize seed using AFFINE model
+        seed_u, seed_v, seed_dudx, seed_dudy, seed_dvdx, seed_dvdy, seed_cc, seed_conv, seed_iter = _ic_gn_affine(
             ref_bcoef, cur_bcoef, border,
             seed.x, seed.y, radius,
             seed.u, seed.v,
+            0.0, 0.0, 0.0, 0.0,  # Initial strain guess = 0
             cutoff_diffnorm, cutoff_iteration,
         )
 
@@ -1481,12 +1488,14 @@ class DICAnalysis:
             return 0
 
         print(f"  Seed result: u={seed_u:.4f}, v={seed_v:.4f}, CC={seed_cc:.4f}")
+        print(f"  Seed strain: dudx={seed_dudx:.6f}, dudy={seed_dudy:.6f}, dvdx={seed_dvdx:.6f}, dvdy={seed_dvdy:.6f}")
 
-        # Priority queue: (neg_cc, insertion_order, x, y, u, v)
+        # Priority queue: (neg_cc, insertion_order, x, y, u, v, dudx, dudy, dvdx, dvdy)
         # Using negative CC because heapq is a min-heap
         insertion_counter = 0
         heap = []
-        heapq.heappush(heap, (-seed_cc, insertion_counter, seed.x, seed.y, seed_u, seed_v))
+        heapq.heappush(heap, (-seed_cc, insertion_counter, seed.x, seed.y,
+                              seed_u, seed_v, seed_dudx, seed_dudy, seed_dvdx, seed_dvdy))
         insertion_counter += 1
 
         # Track calculated points
@@ -1502,7 +1511,7 @@ class DICAnalysis:
 
         while heap:
             # Pop point with highest correlation
-            neg_cc, _, x, y, u, v = heapq.heappop(heap)
+            neg_cc, _, x, y, u, v, dudx, dudy, dvdx, dvdy = heapq.heappop(heap)
             cc = -neg_cc
 
             ox, oy = x // step, y // step
@@ -1514,6 +1523,13 @@ class DICAnalysis:
             roi_plot[oy, ox] = True
             converged[oy, ox] = True
             iterations[oy, ox] = 0
+
+            # Store strain for propagation
+            dudx_field[oy, ox] = dudx
+            dudy_field[oy, ox] = dudy
+            dvdx_field[oy, ox] = dvdx
+            dvdy_field[oy, ox] = dvdy
+
             points_processed += 1
 
             # Progress
@@ -1539,39 +1555,24 @@ class DICAnalysis:
                     reject_outside_roi += 1
                     continue
 
-                # Initial guess: use MEDIAN of all calculated neighbors (more robust)
-                # This prevents single outliers from propagating errors
-                if use_prev_result and prev_roi[ny_out, nx_out] and not np.isnan(prev_u[ny_out, nx_out]):
-                    u_init = prev_u[ny_out, nx_out]
-                    v_init = prev_v[ny_out, nx_out]
-                else:
-                    # Collect all calculated neighbors' displacements
-                    neighbor_u = []
-                    neighbor_v = []
-                    for nox, noy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                        nnx, nny = nx_out + nox, ny_out + noy
-                        if 0 <= nny < out_h and 0 <= nnx < out_w:
-                            if roi_plot[nny, nnx] and not np.isnan(u_plot[nny, nnx]):
-                                neighbor_u.append(u_plot[nny, nnx])
-                                neighbor_v.append(v_plot[nny, nnx])
+                # Initial guess: propagate displacement using strain
+                # u_new = u + dudx * dx + dudy * dy
+                # v_new = v + dvdx * dx + dvdy * dy
+                u_init = u + dudx * dx_step + dudy * dy_step
+                v_init = v + dvdx * dx_step + dvdy * dy_step
 
-                    if len(neighbor_u) >= 2:
-                        # Use median of neighbors (robust against outliers)
-                        u_init = float(np.median(neighbor_u))
-                        v_init = float(np.median(neighbor_v))
-                    elif len(neighbor_u) == 1:
-                        u_init = neighbor_u[0]
-                        v_init = neighbor_v[0]
-                    else:
-                        # Fallback to parent
-                        u_init = u
-                        v_init = v
+                # Initial strain guess: use parent's strain
+                dudx_init = dudx
+                dudy_init = dudy
+                dvdx_init = dvdx
+                dvdy_init = dvdy
 
-                # Run IC-GN with TRANSLATION model
-                new_u, new_v, new_cc, new_conv, new_iter = _ic_gn_translation(
+                # Run IC-GN with AFFINE model
+                new_u, new_v, new_dudx, new_dudy, new_dvdx, new_dvdy, new_cc, new_conv, new_iter = _ic_gn_affine(
                     ref_bcoef, cur_bcoef, border,
                     nx, ny, radius,
                     u_init, v_init,
+                    dudx_init, dudy_init, dvdx_init, dvdy_init,
                     cutoff_diffnorm, cutoff_iteration,
                 )
 
@@ -1590,26 +1591,6 @@ class DICAnalysis:
                               f"result=({new_u:.2f}, {new_v:.2f}), CC={new_cc:.4f}")
                     continue
 
-                # Consistency check: if result differs significantly from neighbors,
-                # try again with median of neighbors as initial guess
-                if len(neighbor_u) >= 2:
-                    median_u = float(np.median(neighbor_u))
-                    median_v = float(np.median(neighbor_v))
-
-                    # If result differs by more than 0.3 pixels from median, retry
-                    if abs(new_u - median_u) > 0.3 or abs(new_v - median_v) > 0.3:
-                        retry_u, retry_v, retry_cc, _, _ = _ic_gn_translation(
-                            ref_bcoef, cur_bcoef, border,
-                            nx, ny, radius,
-                            median_u, median_v,
-                            cutoff_diffnorm, cutoff_iteration,
-                        )
-
-                        # Keep result closer to median if CC is similar (within 0.01)
-                        if not np.isnan(retry_cc) and retry_cc > new_cc - 0.01:
-                            if abs(retry_u - median_u) < abs(new_u - median_u):
-                                new_u, new_v, new_cc = retry_u, retry_v, retry_cc
-
                 # Displacement jump cutoff
                 if abs(u_init - new_u) >= cutoff_disp or abs(v_init - new_v) >= cutoff_disp:
                     reject_disp_jump += 1
@@ -1618,7 +1599,8 @@ class DICAnalysis:
                               f"result=({new_u:.2f}, {new_v:.2f}), CC={new_cc:.4f}")
                     continue
 
-                heapq.heappush(heap, (-new_cc, insertion_counter, nx, ny, new_u, new_v))
+                heapq.heappush(heap, (-new_cc, insertion_counter, nx, ny,
+                                      new_u, new_v, new_dudx, new_dudy, new_dvdx, new_dvdy))
                 insertion_counter += 1
 
         # Debug summary
