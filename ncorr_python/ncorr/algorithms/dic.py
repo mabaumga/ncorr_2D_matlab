@@ -1430,9 +1430,9 @@ class DICAnalysis:
         """
         Process a single region using flood-fill from seed.
 
-        MATLAB-compatible implementation using:
-        1. Priority queue (heapq) - highest correlation processed first
-        2. 6-parameter affine model with strain-based initial guess propagation
+        Hybrid approach:
+        1. Priority queue (heapq) - highest correlation processed first (like MATLAB)
+        2. Translation model (2-parameter) for stability
         3. Displacement jump cutoff (spacing+1 pixels)
         4. MATLAB-identical neighbor order: top, right, bottom, left
         """
@@ -1446,13 +1446,11 @@ class DICAnalysis:
         # MATLAB cutoffs
         cutoff_disp = float(step)  # Displacement jump cutoff (spacing+1 in MATLAB)
 
-        # DEBUG: Print seed and parameters
+        # DEBUG
         print(f"\n{'='*60}")
-        print(f"DEBUG _process_region_optimized (MATLAB-style v2):")
-        print(f"  Seed position: ({seed.x}, {seed.y})")
-        print(f"  Seed displacement: u={seed.u:.4f}, v={seed.v:.4f}")
-        print(f"  Radius: {radius}, Step: {step}")
-        print(f"  Displacement cutoff: {cutoff_disp}")
+        print(f"DEBUG: Hybrid approach (Priority Queue + Translation Model)")
+        print(f"  Seed: ({seed.x}, {seed.y}), u={seed.u:.4f}, v={seed.v:.4f}")
+        print(f"  Step: {step}, Cutoff: {cutoff_disp}")
         print(f"{'='*60}")
 
         # Get region data for in-region checking
@@ -1462,55 +1460,46 @@ class DICAnalysis:
 
         out_h, out_w = u_plot.shape
 
-        # Initialize seed - first compute its affine parameters
-        seed_u, seed_v, seed_dudx, seed_dudy, seed_dvdx, seed_dvdy, seed_cc, seed_conv, seed_iter = _ic_gn_affine(
+        # Initialize seed using TRANSLATION model (more stable)
+        seed_u, seed_v, seed_cc, seed_conv, seed_iter = _ic_gn_translation(
             ref_bcoef, cur_bcoef, border,
             seed.x, seed.y, radius,
             seed.u, seed.v,
-            0.0, 0.0, 0.0, 0.0,  # Zero strain initial guess
             cutoff_diffnorm, cutoff_iteration,
         )
 
         if np.isnan(seed_cc) or seed_cc < 0.5:
-            print(f"WARNING: Seed failed to converge! CC={seed_cc}")
+            print(f"WARNING: Seed failed! CC={seed_cc}")
             return 0
 
-        print(f"  Seed IC-GN result: u={seed_u:.4f}, v={seed_v:.4f}, CC={seed_cc:.4f}")
-        print(f"  Seed strain: dudx={seed_dudx:.6f}, dudy={seed_dudy:.6f}, dvdx={seed_dvdx:.6f}, dvdy={seed_dvdy:.6f}")
+        print(f"  Seed result: u={seed_u:.4f}, v={seed_v:.4f}, CC={seed_cc:.4f}")
 
-        # Priority queue: (neg_cc, insertion_order, x, y, u, v, dudx, dudy, dvdx, dvdy)
-        # Using negative CC because heapq is a min-heap, and we want highest CC first
-        # insertion_order as tie-breaker for stable ordering (like MATLAB)
+        # Priority queue: (neg_cc, insertion_order, x, y, u, v)
+        # Using negative CC because heapq is a min-heap
         insertion_counter = 0
         heap = []
-        heapq.heappush(heap, (-seed_cc, insertion_counter, seed.x, seed.y, seed_u, seed_v,
-                              seed_dudx, seed_dudy, seed_dvdx, seed_dvdy))
+        heapq.heappush(heap, (-seed_cc, insertion_counter, seed.x, seed.y, seed_u, seed_v))
         insertion_counter += 1
 
-        # Track which points have been calculated (MATLAB: plot_calcpoints)
-        # Mark AFTER calculation, not before (like MATLAB)
+        # Track calculated points
         calc_points = np.zeros((out_h, out_w), dtype=np.bool_)
-
-        # Mark seed as calculated
         ox_seed, oy_seed = seed.x // step, seed.y // step
         calc_points[oy_seed, ox_seed] = True
 
         points_processed = 0
         last_progress_percent = -1
 
-        # Estimate total points if not provided
         if estimated_points <= 0:
             estimated_points = region.totalpoints // (step * step) if region.totalpoints > 0 else 10000
 
         while heap:
-            # Pop point with highest correlation (lowest negative CC)
-            neg_cc, _, x, y, u, v, dudx, dudy, dvdx, dvdy = heapq.heappop(heap)
+            # Pop point with highest correlation
+            neg_cc, _, x, y, u, v = heapq.heappop(heap)
             cc = -neg_cc
 
-            # Convert to output coordinates
             ox, oy = x // step, y // step
 
-            # Store result in output arrays
+            # Store result
             u_plot[oy, ox] = u
             v_plot[oy, ox] = v
             corrcoef_plot[oy, ox] = cc
@@ -1519,84 +1508,57 @@ class DICAnalysis:
             iterations[oy, ox] = 0
             points_processed += 1
 
-            # Progress reporting
+            # Progress
             current_percent = int(points_processed * 100 / max(1, estimated_points))
             if current_percent > last_progress_percent and self._progress_callback:
                 last_progress_percent = current_percent
-                progress = min(0.99, points_processed / max(1, estimated_points))
-                self._report_progress(
-                    progress,
-                    f"Processing... {points_processed:,} points ({current_percent}%)"
-                )
+                self._report_progress(min(0.99, points_processed / max(1, estimated_points)),
+                                      f"Processing... {points_processed:,} points")
 
-            # Analyze four neighbors - MATLAB order: top, right, bottom, left
-            # MATLAB: y-step, x+step, y+step, x-step
+            # Analyze neighbors - MATLAB order: top, right, bottom, left
             for dx_step, dy_step in [(0, -step), (step, 0), (0, step), (-step, 0)]:
                 nx, ny = x + dx_step, y + dy_step
-
-                # Convert to output coordinates
                 nx_out, ny_out = nx // step, ny // step
 
-                # Skip if outside bounds
                 if not (0 <= ny_out < out_h and 0 <= nx_out < out_w):
                     continue
 
-                # Skip if already calculated (check BEFORE calculation, like MATLAB)
                 if calc_points[ny_out, nx_out]:
                     continue
 
-                # Check if point is in region BEFORE marking as calculated
                 if not _check_point_in_region(nx, ny, leftbound, noderange, nodelist):
-                    # Still mark as calculated to prevent re-checking
                     calc_points[ny_out, nx_out] = True
                     continue
 
-                # MATLAB-style initial guess using strain propagation:
-                # u_init = u + dudx*(nx - x) + dudy*(ny - y)
-                # v_init = v + dvdx*(nx - x) + dvdy*(ny - y)
+                # Initial guess: just use parent's displacement (no strain prediction)
                 if use_prev_result and prev_roi[ny_out, nx_out] and not np.isnan(prev_u[ny_out, nx_out]):
                     u_init = prev_u[ny_out, nx_out]
                     v_init = prev_v[ny_out, nx_out]
-                    dudx_init, dudy_init, dvdx_init, dvdy_init = 0.0, 0.0, 0.0, 0.0
                 else:
-                    # Strain-based initial guess prediction (MATLAB-style)
-                    delta_x = float(nx - x)
-                    delta_y = float(ny - y)
-                    u_init = u + dudx * delta_x + dudy * delta_y
-                    v_init = v + dvdx * delta_x + dvdy * delta_y
-                    dudx_init = dudx
-                    dudy_init = dudy
-                    dvdx_init = dvdx
-                    dvdy_init = dvdy
+                    u_init = u
+                    v_init = v
 
-                # Run IC-GN with 6-parameter affine model
-                new_u, new_v, new_dudx, new_dudy, new_dvdx, new_dvdy, new_cc, new_conv, new_iter = _ic_gn_affine(
+                # Run IC-GN with TRANSLATION model
+                new_u, new_v, new_cc, new_conv, new_iter = _ic_gn_translation(
                     ref_bcoef, cur_bcoef, border,
                     nx, ny, radius,
                     u_init, v_init,
-                    dudx_init, dudy_init, dvdx_init, dvdy_init,
                     cutoff_diffnorm, cutoff_iteration,
                 )
 
-                # Mark as calculated AFTER calculation (like MATLAB)
                 calc_points[ny_out, nx_out] = True
 
-                # Check if result is valid
                 if np.isnan(new_cc):
                     continue
 
-                # MATLAB cutoff: correlation coefficient (ZNSSD < 2.0 means NCC > 0)
-                # Being more lenient like MATLAB
                 if new_cc < 0.0:
                     continue
 
-                # MATLAB cutoff: displacement jump must be less than step
+                # Displacement jump cutoff
                 if abs(u_init - new_u) >= cutoff_disp or abs(v_init - new_v) >= cutoff_disp:
                     continue
 
-                # Add to priority queue with insertion order for stable sorting
-                heapq.heappush(heap, (-new_cc, insertion_counter, nx, ny, new_u, new_v,
-                                      new_dudx, new_dudy, new_dvdx, new_dvdy))
+                heapq.heappush(heap, (-new_cc, insertion_counter, nx, ny, new_u, new_v))
                 insertion_counter += 1
 
         return points_processed
