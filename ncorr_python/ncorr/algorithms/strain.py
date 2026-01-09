@@ -3,6 +3,8 @@ Strain calculation algorithms.
 
 Computes Green-Lagrange and Eulerian-Almansi strains from displacement fields.
 Equivalent to ncorr_alg_dispgrad.cpp
+
+All performance-critical functions are at module level with Numba acceleration.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
-from numba import jit, prange
+from numba import njit, prange
 
 from ..core.roi import NcorrROI
 
@@ -42,6 +44,178 @@ class StrainResult:
     dvdx: Optional[NDArray[np.float64]] = None
     dvdy: Optional[NDArray[np.float64]] = None
 
+
+# =============================================================================
+# Module-level Numba-accelerated functions
+# =============================================================================
+
+@njit(cache=True, parallel=True, fastmath=True)
+def _calculate_gradients_numba(
+    u: NDArray[np.float64],
+    v: NDArray[np.float64],
+    mask: NDArray[np.bool_],
+    r: int,
+    spacing: float,
+) -> Tuple[NDArray[np.float64], NDArray[np.float64],
+           NDArray[np.float64], NDArray[np.float64], NDArray[np.bool_]]:
+    """
+    Calculate displacement gradients using central differences.
+
+    Numba-accelerated version with parallel processing.
+
+    Args:
+        u: U displacement field
+        v: V displacement field
+        mask: Valid data mask
+        r: Strain radius
+        spacing: Pixel spacing
+
+    Returns:
+        Tuple of (dudx, dudy, dvdx, dvdy, valid_mask)
+    """
+    h, w = u.shape
+
+    dudx = np.full((h, w), np.nan, dtype=np.float64)
+    dudy = np.full((h, w), np.nan, dtype=np.float64)
+    dvdx = np.full((h, w), np.nan, dtype=np.float64)
+    dvdy = np.full((h, w), np.nan, dtype=np.float64)
+    valid = np.zeros((h, w), dtype=np.bool_)
+
+    scale = 1.0 / (2.0 * r * spacing)
+
+    for j in prange(r, h - r):
+        for i in range(r, w - r):
+            if not mask[j, i]:
+                continue
+
+            # Check center point
+            if np.isnan(u[j, i]) or np.isnan(v[j, i]):
+                continue
+
+            # Check boundary points only (much faster than checking all points)
+            u_left = u[j, i - r]
+            u_right = u[j, i + r]
+            u_top = u[j - r, i]
+            u_bottom = u[j + r, i]
+            v_left = v[j, i - r]
+            v_right = v[j, i + r]
+            v_top = v[j - r, i]
+            v_bottom = v[j + r, i]
+
+            if (np.isnan(u_left) or np.isnan(u_right) or
+                np.isnan(u_top) or np.isnan(u_bottom) or
+                np.isnan(v_left) or np.isnan(v_right) or
+                np.isnan(v_top) or np.isnan(v_bottom)):
+                continue
+
+            # Central differences
+            dudx[j, i] = (u_right - u_left) * scale
+            dudy[j, i] = (u_bottom - u_top) * scale
+            dvdx[j, i] = (v_right - v_left) * scale
+            dvdy[j, i] = (v_bottom - v_top) * scale
+
+            valid[j, i] = True
+
+    return dudx, dudy, dvdx, dvdy, valid
+
+
+@njit(cache=True, parallel=True, fastmath=True)
+def _compute_green_lagrange_strains(
+    dudx: NDArray[np.float64],
+    dudy: NDArray[np.float64],
+    dvdx: NDArray[np.float64],
+    dvdy: NDArray[np.float64],
+    valid: NDArray[np.bool_],
+) -> Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    """
+    Compute Green-Lagrange strains from displacement gradients.
+
+    E = 1/2 * (F^T * F - I)
+
+    Args:
+        dudx, dudy, dvdx, dvdy: Displacement gradients
+        valid: Valid data mask
+
+    Returns:
+        Tuple of (exx, exy, eyy)
+    """
+    h, w = valid.shape
+    exx = np.full((h, w), np.nan, dtype=np.float64)
+    exy = np.full((h, w), np.nan, dtype=np.float64)
+    eyy = np.full((h, w), np.nan, dtype=np.float64)
+
+    for j in prange(h):
+        for i in range(w):
+            if not valid[j, i]:
+                continue
+
+            ux = dudx[j, i]
+            uy = dudy[j, i]
+            vx = dvdx[j, i]
+            vy = dvdy[j, i]
+
+            # Exx = du/dx + 0.5 * ((du/dx)^2 + (dv/dx)^2)
+            exx[j, i] = ux + 0.5 * (ux * ux + vx * vx)
+
+            # Eyy = dv/dy + 0.5 * ((du/dy)^2 + (dv/dy)^2)
+            eyy[j, i] = vy + 0.5 * (uy * uy + vy * vy)
+
+            # Exy = 0.5 * (du/dy + dv/dx + du/dx*du/dy + dv/dx*dv/dy)
+            exy[j, i] = 0.5 * (uy + vx + ux * uy + vx * vy)
+
+    return exx, exy, eyy
+
+
+@njit(cache=True, parallel=True, fastmath=True)
+def _compute_eulerian_almansi_strains(
+    dudx: NDArray[np.float64],
+    dudy: NDArray[np.float64],
+    dvdx: NDArray[np.float64],
+    dvdy: NDArray[np.float64],
+    valid: NDArray[np.bool_],
+) -> Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    """
+    Compute Eulerian-Almansi strains from displacement gradients.
+
+    e = 1/2 * (I - F^(-T) * F^(-1))
+
+    Args:
+        dudx, dudy, dvdx, dvdy: Displacement gradients
+        valid: Valid data mask
+
+    Returns:
+        Tuple of (exx, exy, eyy)
+    """
+    h, w = valid.shape
+    exx = np.full((h, w), np.nan, dtype=np.float64)
+    exy = np.full((h, w), np.nan, dtype=np.float64)
+    eyy = np.full((h, w), np.nan, dtype=np.float64)
+
+    for j in prange(h):
+        for i in range(w):
+            if not valid[j, i]:
+                continue
+
+            ux = dudx[j, i]
+            uy = dudy[j, i]
+            vx = dvdx[j, i]
+            vy = dvdy[j, i]
+
+            # exx = du/dx - 0.5 * ((du/dx)^2 + (dv/dx)^2)
+            exx[j, i] = ux - 0.5 * (ux * ux + vx * vx)
+
+            # eyy = dv/dy - 0.5 * ((du/dy)^2 + (dv/dy)^2)
+            eyy[j, i] = vy - 0.5 * (uy * uy + vy * vy)
+
+            # exy = 0.5 * (du/dy + dv/dx - du/dx*du/dy - dv/dx*dv/dy)
+            exy[j, i] = 0.5 * (uy + vx - ux * uy - vx * vy)
+
+    return exx, exy, eyy
+
+
+# =============================================================================
+# StrainCalculator class
+# =============================================================================
 
 class StrainCalculator:
     """
@@ -73,13 +247,6 @@ class StrainCalculator:
 
         E = 1/2 * (F^T * F - I)
 
-        Where F = I + grad(u) is the deformation gradient.
-
-        Strain components:
-            Exx = du/dx + 0.5 * ((du/dx)^2 + (dv/dx)^2)
-            Eyy = dv/dy + 0.5 * ((du/dy)^2 + (dv/dy)^2)
-            Exy = 0.5 * (du/dy + dv/dx) + du/dx*du/dy + dv/dx*dv/dy
-
         Args:
             u: U displacement field
             v: V displacement field
@@ -89,29 +256,15 @@ class StrainCalculator:
         Returns:
             StrainResult with Green-Lagrange strains
         """
-        # Calculate displacement gradients
-        dudx, dudy, dvdx, dvdy, grad_roi = self._calculate_gradients(
-            u, v, roi.mask, spacing
+        # Calculate displacement gradients using Numba
+        dudx, dudy, dvdx, dvdy, grad_roi = _calculate_gradients_numba(
+            u, v, roi.mask, self.strain_radius, float(spacing)
         )
 
-        # Initialize strain arrays
-        exx = np.full_like(u, np.nan)
-        exy = np.full_like(u, np.nan)
-        eyy = np.full_like(u, np.nan)
-
-        # Calculate Green-Lagrange strains where gradients are valid
-        valid = grad_roi
-
-        # Exx = du/dx + 0.5 * ((du/dx)^2 + (dv/dx)^2)
-        exx[valid] = dudx[valid] + 0.5 * (dudx[valid]**2 + dvdx[valid]**2)
-
-        # Eyy = dv/dy + 0.5 * ((du/dy)^2 + (dv/dy)^2)
-        eyy[valid] = dvdy[valid] + 0.5 * (dudy[valid]**2 + dvdy[valid]**2)
-
-        # Exy = 0.5 * (du/dy + dv/dx + du/dx*du/dy + dv/dx*dv/dy)
-        exy[valid] = 0.5 * (dudy[valid] + dvdx[valid] +
-                           dudx[valid] * dudy[valid] +
-                           dvdx[valid] * dvdy[valid])
+        # Calculate strains using Numba
+        exx, exy, eyy = _compute_green_lagrange_strains(
+            dudx, dudy, dvdx, dvdy, grad_roi
+        )
 
         return StrainResult(
             exx=exx,
@@ -136,11 +289,6 @@ class StrainCalculator:
 
         e = 1/2 * (I - F^(-T) * F^(-1))
 
-        Strain components:
-            exx = du/dx - 0.5 * ((du/dx)^2 + (dv/dx)^2)
-            eyy = dv/dy - 0.5 * ((du/dy)^2 + (dv/dy)^2)
-            exy = 0.5 * (du/dy + dv/dx) - du/dx*du/dy - dv/dx*dv/dy
-
         Args:
             u: U displacement field
             v: V displacement field
@@ -150,28 +298,15 @@ class StrainCalculator:
         Returns:
             StrainResult with Eulerian-Almansi strains
         """
-        # Calculate displacement gradients
-        dudx, dudy, dvdx, dvdy, grad_roi = self._calculate_gradients(
-            u, v, roi.mask, spacing
+        # Calculate displacement gradients using Numba
+        dudx, dudy, dvdx, dvdy, grad_roi = _calculate_gradients_numba(
+            u, v, roi.mask, self.strain_radius, float(spacing)
         )
 
-        # Initialize strain arrays
-        exx = np.full_like(u, np.nan)
-        exy = np.full_like(u, np.nan)
-        eyy = np.full_like(u, np.nan)
-
-        valid = grad_roi
-
-        # exx = du/dx - 0.5 * ((du/dx)^2 + (dv/dx)^2)
-        exx[valid] = dudx[valid] - 0.5 * (dudx[valid]**2 + dvdx[valid]**2)
-
-        # eyy = dv/dy - 0.5 * ((du/dy)^2 + (dv/dy)^2)
-        eyy[valid] = dvdy[valid] - 0.5 * (dudy[valid]**2 + dvdy[valid]**2)
-
-        # exy = 0.5 * (du/dy + dv/dx - du/dx*du/dy - dv/dx*dv/dy)
-        exy[valid] = 0.5 * (dudy[valid] + dvdx[valid] -
-                           dudx[valid] * dudy[valid] -
-                           dvdx[valid] * dvdy[valid])
+        # Calculate strains using Numba
+        exx, exy, eyy = _compute_eulerian_almansi_strains(
+            dudx, dudy, dvdx, dvdy, grad_roi
+        )
 
         return StrainResult(
             exx=exx,
@@ -183,77 +318,6 @@ class StrainCalculator:
             dvdx=dvdx,
             dvdy=dvdy,
         )
-
-    def _calculate_gradients(
-        self,
-        u: NDArray[np.float64],
-        v: NDArray[np.float64],
-        mask: NDArray[np.bool_],
-        spacing: int,
-    ) -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray]:
-        """
-        Calculate displacement gradients using finite differences.
-
-        Uses central differences with configurable radius.
-
-        Args:
-            u: U displacement field
-            v: V displacement field
-            mask: Valid data mask
-            spacing: Pixel spacing
-
-        Returns:
-            Tuple of (dudx, dudy, dvdx, dvdy, valid_mask)
-        """
-        h, w = u.shape
-        r = self.strain_radius
-
-        dudx = np.full((h, w), np.nan)
-        dudy = np.full((h, w), np.nan)
-        dvdx = np.full((h, w), np.nan)
-        dvdy = np.full((h, w), np.nan)
-        valid = np.zeros((h, w), dtype=np.bool_)
-
-        # Reduce mask by strain radius
-        reduced_mask = mask.copy()
-
-        # Erode mask by radius to ensure all gradient calculations are valid
-        from scipy.ndimage import binary_erosion
-        struct = np.ones((2 * r + 1, 2 * r + 1))
-        reduced_mask = binary_erosion(mask, struct)
-
-        # Calculate gradients using central differences
-        for j in range(r, h - r):
-            for i in range(r, w - r):
-                if not reduced_mask[j, i]:
-                    continue
-
-                if np.isnan(u[j, i]) or np.isnan(v[j, i]):
-                    continue
-
-                # Check if all points in radius are valid
-                all_valid = True
-                for dj in range(-r, r + 1):
-                    for di in range(-r, r + 1):
-                        if np.isnan(u[j + dj, i + di]) or np.isnan(v[j + dj, i + di]):
-                            all_valid = False
-                            break
-                    if not all_valid:
-                        break
-
-                if not all_valid:
-                    continue
-
-                # Central differences
-                # du/dx = (u(x+r) - u(x-r)) / (2*r*spacing)
-                dudx[j, i] = (u[j, i + r] - u[j, i - r]) / (2.0 * r * spacing)
-                dudy[j, i] = (u[j + r, i] - u[j - r, i]) / (2.0 * r * spacing)
-                dvdx[j, i] = (v[j, i + r] - v[j, i - r]) / (2.0 * r * spacing)
-                dvdy[j, i] = (v[j + r, i] - v[j - r, i]) / (2.0 * r * spacing)
-
-                valid[j, i] = True
-
-        return dudx, dudy, dvdx, dvdy, valid
 
     @staticmethod
     def calculate_principal_strains(
@@ -272,10 +336,6 @@ class StrainCalculator:
         Returns:
             Tuple of (e1, e2, theta) - principal strains and angle
         """
-        # Principal strains from eigenvalue decomposition
-        # E = [[exx, exy], [exy, eyy]]
-        # Eigenvalues: e1, e2 = (exx + eyy)/2 +/- sqrt(((exx-eyy)/2)^2 + exy^2)
-
         avg = 0.5 * (exx + eyy)
         diff = 0.5 * (exx - eyy)
         r = np.sqrt(diff**2 + exy**2)
@@ -305,9 +365,6 @@ class StrainCalculator:
         Returns:
             Von Mises equivalent strain
         """
-        # von Mises for plane strain:
-        # e_vm = sqrt(2/3) * sqrt(exx^2 + eyy^2 - exx*eyy + 3*exy^2)
-
         return np.sqrt(2.0 / 3.0) * np.sqrt(
             exx**2 + eyy**2 - exx * eyy + 3.0 * exy**2
         )
