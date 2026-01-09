@@ -1446,17 +1446,25 @@ class DICAnalysis:
         # MATLAB cutoffs
         cutoff_disp = float(step)  # Displacement jump cutoff (spacing+1 in MATLAB)
 
+        # Get region data for in-region checking
+        leftbound = region.leftbound
+        noderange = np.asarray(region.noderange, dtype=np.int32)
+        nodelist = np.asarray(region.nodelist, dtype=np.int32)
+
         # DEBUG
         print(f"\n{'='*60}")
         print(f"DEBUG: Hybrid approach (Priority Queue + Translation Model)")
         print(f"  Seed: ({seed.x}, {seed.y}), u={seed.u:.4f}, v={seed.v:.4f}")
         print(f"  Step: {step}, Cutoff: {cutoff_disp}")
+        print(f"  Image size: {ref_bcoef.shape}, Border: {border}")
+        print(f"  ROI leftbound: {leftbound}, noderange len: {len(noderange)}")
         print(f"{'='*60}")
 
-        # Get region data for in-region checking
-        leftbound = region.leftbound
-        noderange = np.asarray(region.noderange, dtype=np.int32)
-        nodelist = np.asarray(region.nodelist, dtype=np.int32)
+        # Debug counters for rejection reasons
+        reject_outside_roi = 0
+        reject_nan_cc = 0
+        reject_low_cc = 0
+        reject_disp_jump = 0
 
         out_h, out_w = u_plot.shape
 
@@ -1528,6 +1536,7 @@ class DICAnalysis:
 
                 if not _check_point_in_region(nx, ny, leftbound, noderange, nodelist):
                     calc_points[ny_out, nx_out] = True
+                    reject_outside_roi += 1
                     continue
 
                 # Initial guess: use MEDIAN of all calculated neighbors (more robust)
@@ -1569,9 +1578,13 @@ class DICAnalysis:
                 calc_points[ny_out, nx_out] = True
 
                 if np.isnan(new_cc):
+                    reject_nan_cc += 1
+                    if reject_nan_cc <= 5:  # Print first 5 NaN rejections
+                        print(f"  NaN at ({nx}, {ny}): init=({u_init:.2f}, {v_init:.2f})")
                     continue
 
                 if new_cc < 0.0:
+                    reject_low_cc += 1
                     continue
 
                 # Consistency check: if result differs significantly from neighbors,
@@ -1596,10 +1609,25 @@ class DICAnalysis:
 
                 # Displacement jump cutoff
                 if abs(u_init - new_u) >= cutoff_disp or abs(v_init - new_v) >= cutoff_disp:
+                    reject_disp_jump += 1
+                    if reject_disp_jump <= 5:  # Print first 5 displacement jump rejections
+                        print(f"  Disp jump at ({nx}, {ny}): init=({u_init:.2f}, {v_init:.2f}), "
+                              f"result=({new_u:.2f}, {new_v:.2f}), CC={new_cc:.4f}")
                     continue
 
                 heapq.heappush(heap, (-new_cc, insertion_counter, nx, ny, new_u, new_v))
                 insertion_counter += 1
+
+        # Debug summary
+        print(f"\n{'='*60}")
+        print(f"DEBUG: Propagation Summary")
+        print(f"  Points processed: {points_processed}")
+        print(f"  Rejections:")
+        print(f"    Outside ROI:       {reject_outside_roi}")
+        print(f"    NaN correlation:   {reject_nan_cc}")
+        print(f"    Low correlation:   {reject_low_cc}")
+        print(f"    Displacement jump: {reject_disp_jump}")
+        print(f"{'='*60}")
 
         return points_processed
 
