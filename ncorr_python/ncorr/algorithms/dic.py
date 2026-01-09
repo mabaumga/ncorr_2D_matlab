@@ -1614,6 +1614,55 @@ class DICAnalysis:
         print(f"    Displacement jump: {reject_disp_jump}")
         print(f"{'='*60}")
 
+        # Extended debug: Show results summary and grid
+        if points_processed > 0:
+            valid_mask = roi_plot
+            if np.any(valid_mask):
+                u_valid = u_plot[valid_mask]
+                v_valid = v_plot[valid_mask]
+                cc_valid = corrcoef_plot[valid_mask]
+                dudx_valid = dudx_field[valid_mask]
+                dvdy_valid = dvdy_field[valid_mask]
+
+                print(f"\n{'='*60}")
+                print(f"DEBUG: Results Summary")
+                print(f"{'='*60}")
+                print(f"  Displacement u: min={np.min(u_valid):.4f}, max={np.max(u_valid):.4f}, "
+                      f"mean={np.mean(u_valid):.4f}, std={np.std(u_valid):.4f}")
+                print(f"  Displacement v: min={np.min(v_valid):.4f}, max={np.max(v_valid):.4f}, "
+                      f"mean={np.mean(v_valid):.4f}, std={np.std(v_valid):.4f}")
+                print(f"  Correlation CC: min={np.min(cc_valid):.4f}, max={np.max(cc_valid):.4f}, "
+                      f"mean={np.mean(cc_valid):.4f}, std={np.std(cc_valid):.4f}")
+                print(f"  Strain dudx:    min={np.min(dudx_valid):.6f}, max={np.max(dudx_valid):.6f}, "
+                      f"mean={np.mean(dudx_valid):.6f}")
+                print(f"  Strain dvdy:    min={np.min(dvdy_valid):.6f}, max={np.max(dvdy_valid):.6f}, "
+                      f"mean={np.mean(dvdy_valid):.6f}")
+
+                # Show coarse grid of u values (every 10th point)
+                print(f"\n  Coarse grid of u-displacement (every 10th point):")
+                grid_step = 10
+                for iy in range(0, out_h, grid_step):
+                    row_str = f"    y={iy:3d}: "
+                    for ix in range(0, out_w, grid_step):
+                        if roi_plot[iy, ix]:
+                            row_str += f"{u_plot[iy, ix]:7.2f}"
+                        else:
+                            row_str += "      -"
+                    print(row_str)
+
+                # Show coarse grid of CC values
+                print(f"\n  Coarse grid of correlation coefficient (every 10th point):")
+                for iy in range(0, out_h, grid_step):
+                    row_str = f"    y={iy:3d}: "
+                    for ix in range(0, out_w, grid_step):
+                        if roi_plot[iy, ix]:
+                            row_str += f"{corrcoef_plot[iy, ix]:7.3f}"
+                        else:
+                            row_str += "      -"
+                    print(row_str)
+
+                print(f"{'='*60}")
+
         return points_processed
 
 
