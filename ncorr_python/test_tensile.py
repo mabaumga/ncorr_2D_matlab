@@ -12,6 +12,8 @@ Key findings:
 - Displacement jump cutoff rarely triggers with correct initial guess
 """
 
+import os
+import tempfile
 import numpy as np
 from scipy.ndimage import map_coordinates, shift
 from PIL import Image
@@ -20,6 +22,9 @@ from ncorr.core.image import NcorrImage
 from ncorr.core.roi import NcorrROI
 from ncorr.core.dic_parameters import DICParameters
 from ncorr.algorithms.dic import DICAnalysis, SeedInfo
+
+# Use temp directory that works on all platforms
+TEMP_DIR = tempfile.gettempdir()
 
 
 def create_synthetic_speckle(width, height, seed=42, speckle_size=3, speckle_density=0.3):
@@ -159,9 +164,11 @@ def main():
     v_shift = 0.0
 
     # Save images for inspection
-    Image.fromarray(ref_image).save('/tmp/ref_tensile.png')
-    Image.fromarray(cur_image).save('/tmp/cur_tensile.png')
-    print("Saved images to /tmp/ref_tensile.png and /tmp/cur_tensile.png")
+    ref_path = os.path.join(TEMP_DIR, 'ref_tensile.png')
+    cur_path = os.path.join(TEMP_DIR, 'cur_tensile.png')
+    Image.fromarray(ref_image).save(ref_path)
+    Image.fromarray(cur_image).save(cur_path)
+    print(f"Saved images to {ref_path} and {cur_path}")
 
     # Create NcorrImages
     ref_img = NcorrImage.from_array(ref_image)
