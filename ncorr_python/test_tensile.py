@@ -28,34 +28,28 @@ TEMP_DIR = tempfile.gettempdir()
 
 
 def create_synthetic_speckle(width, height, seed=42, speckle_size=3, speckle_density=0.3):
-    """Create a synthetic speckle pattern with random dots."""
+    """Create a synthetic speckle pattern with random dots - improved version."""
     np.random.seed(seed)
 
-    # Start with medium gray background
-    pattern = np.ones((height, width), dtype=np.float64) * 0.5
+    # Use a more robust approach: generate pattern using filtered noise
+    # This avoids overflow issues and creates more realistic speckle patterns
 
-    # Add random Gaussian spots (speckles)
-    n_speckles = int(width * height * speckle_density / (speckle_size ** 2))
+    # Start with random noise
+    pattern = np.random.rand(height, width).astype(np.float64)
 
-    for _ in range(n_speckles):
-        cx = np.random.randint(0, width)
-        cy = np.random.randint(0, height)
-        intensity = np.random.uniform(-0.5, 0.5)
+    # Apply Gaussian blur to create speckle-like texture
+    from scipy.ndimage import gaussian_filter
+    pattern = gaussian_filter(pattern, sigma=speckle_size)
 
-        # Add Gaussian spot
-        for dy in range(-speckle_size*2, speckle_size*2 + 1):
-            for dx in range(-speckle_size*2, speckle_size*2 + 1):
-                px, py = cx + dx, cy + dy
-                if 0 <= px < width and 0 <= py < height:
-                    dist_sq = dx*dx + dy*dy
-                    weight = np.exp(-dist_sq / (2 * speckle_size**2))
-                    pattern[py, px] += intensity * weight
+    # Enhance contrast
+    pattern = (pattern - pattern.min()) / (pattern.max() - pattern.min())
 
-    # Add fine noise
-    pattern += np.random.randn(height, width) * 0.05
+    # Add some fine noise for texture
+    fine_noise = np.random.rand(height, width) * 0.1
+    pattern = pattern * 0.9 + fine_noise
 
-    # Normalize to 0-255
-    pattern = np.clip(pattern, 0, 1)
+    # Final normalization to 0-255
+    pattern = (pattern - pattern.min()) / (pattern.max() - pattern.min())
     return (pattern * 255).astype(np.uint8)
 
 
