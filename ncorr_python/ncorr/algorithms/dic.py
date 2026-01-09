@@ -1585,6 +1585,9 @@ class DICAnalysis:
 
                 if new_cc < 0.0:
                     reject_low_cc += 1
+                    if reject_low_cc <= 10:  # Print first 10 low CC rejections
+                        print(f"  Low CC at ({nx}, {ny}): init=({u_init:.2f}, {v_init:.2f}), "
+                              f"result=({new_u:.2f}, {new_v:.2f}), CC={new_cc:.4f}")
                     continue
 
                 # Consistency check: if result differs significantly from neighbors,
