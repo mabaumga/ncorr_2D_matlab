@@ -136,6 +136,141 @@ class DICResult:
             print(f"  Max:                    {diag['iterations_max']}")
         print("=" * 50)
 
+    def analyze_row_banding(self) -> dict:
+        """
+        Analyze horizontal banding artifacts in the v-displacement field.
+
+        Returns:
+            Dictionary with banding statistics
+        """
+        out_h, out_w = self.u.shape
+
+        # Collect per-row statistics
+        row_v_means = []
+        row_u_means = []
+
+        for iy in range(out_h):
+            row_mask = self.roi[iy, :]
+            if np.any(row_mask):
+                row_v_means.append(np.mean(self.v[iy, row_mask]))
+                row_u_means.append(np.mean(self.u[iy, row_mask]))
+
+        if len(row_v_means) < 2:
+            return {"error": "Not enough rows for banding analysis"}
+
+        v_means = np.array(row_v_means)
+        u_means = np.array(row_u_means)
+        v_diffs = np.diff(v_means)
+        u_diffs = np.diff(u_means)
+
+        return {
+            "v_row_std": float(np.std(v_means)),
+            "v_row_range": float(np.max(v_means) - np.min(v_means)),
+            "v_row_to_row_mean": float(np.mean(np.abs(v_diffs))),
+            "v_row_to_row_max": float(np.max(np.abs(v_diffs))),
+            "u_row_std": float(np.std(u_means)),
+            "u_row_to_row_mean": float(np.mean(np.abs(u_diffs))),
+            "banding_detected": float(np.std(v_means)) > 0.5,  # Threshold for banding
+        }
+
+    def smooth_row_banding(self, window_size: int = 5) -> 'DICResult':
+        """
+        Smooth horizontal banding artifacts in the v-displacement field.
+
+        This applies a median filter along the y-direction to reduce row-to-row
+        variations while preserving the overall displacement pattern.
+
+        Args:
+            window_size: Size of the median filter window (must be odd, default 5)
+
+        Returns:
+            New DICResult with smoothed v-field
+        """
+        from scipy.ndimage import median_filter
+
+        # Ensure window size is odd
+        if window_size % 2 == 0:
+            window_size += 1
+
+        # Create a copy of v
+        v_smoothed = self.v.copy()
+
+        # Apply 1D median filter along y-direction for each column
+        out_h, out_w = self.v.shape
+
+        for ix in range(out_w):
+            col_mask = self.roi[:, ix]
+            if np.sum(col_mask) >= window_size:
+                # Get valid values in this column
+                valid_indices = np.where(col_mask)[0]
+                v_col = self.v[valid_indices, ix]
+
+                # Apply median filter
+                v_filtered = median_filter(v_col, size=window_size, mode='reflect')
+
+                # Put back
+                v_smoothed[valid_indices, ix] = v_filtered
+
+        return DICResult(
+            u=self.u.copy(),
+            v=v_smoothed,
+            corrcoef=self.corrcoef.copy(),
+            roi=self.roi.copy(),
+            seed_info=self.seed_info,
+            converged=self.converged.copy() if self.converged is not None else None,
+            iterations=self.iterations.copy() if self.iterations is not None else None,
+        )
+
+    def smooth_displacement_field(self, sigma: float = 1.0) -> 'DICResult':
+        """
+        Apply Gaussian smoothing to both u and v displacement fields.
+
+        This can help reduce noise and banding artifacts while preserving
+        the overall displacement pattern.
+
+        Args:
+            sigma: Standard deviation of Gaussian filter (default 1.0)
+
+        Returns:
+            New DICResult with smoothed displacement fields
+        """
+        from scipy.ndimage import gaussian_filter
+
+        # Create copies
+        u_smoothed = self.u.copy()
+        v_smoothed = self.v.copy()
+
+        # Replace NaN with 0 for filtering, then restore
+        u_valid = np.where(self.roi, self.u, 0)
+        v_valid = np.where(self.roi, self.v, 0)
+
+        # Create weight mask for normalization
+        weight = self.roi.astype(np.float64)
+
+        # Apply Gaussian filter to values and weights
+        u_filtered = gaussian_filter(u_valid, sigma=sigma)
+        v_filtered = gaussian_filter(v_valid, sigma=sigma)
+        weight_filtered = gaussian_filter(weight, sigma=sigma)
+
+        # Normalize (avoid division by zero)
+        mask = weight_filtered > 0.1
+        u_smoothed = np.where(mask, u_filtered / weight_filtered, np.nan)
+        v_smoothed = np.where(mask, v_filtered / weight_filtered, np.nan)
+
+        # Restore original NaN positions
+        u_smoothed = np.where(self.roi, u_smoothed, np.nan)
+        v_smoothed = np.where(self.roi, v_smoothed, np.nan)
+
+        return DICResult(
+            u=u_smoothed,
+            v=v_smoothed,
+            corrcoef=self.corrcoef.copy(),
+            roi=self.roi.copy(),
+            seed_info=self.seed_info,
+            converged=self.converged.copy() if self.converged is not None else None,
+            iterations=self.iterations.copy() if self.iterations is not None else None,
+        )
+
 
 # =============================================================================
 # Module-level Numba-accelerated functions for IC-GN optimization
@@ -1650,6 +1785,17 @@ class DICAnalysis:
                             row_str += "      -"
                     print(row_str)
 
+                # Show coarse grid of v-displacement values
+                print(f"\n  Coarse grid of v-displacement (every 10th point):")
+                for iy in range(0, out_h, grid_step):
+                    row_str = f"    y={iy:3d}: "
+                    for ix in range(0, out_w, grid_step):
+                        if roi_plot[iy, ix]:
+                            row_str += f"{v_plot[iy, ix]:7.2f}"
+                        else:
+                            row_str += "      -"
+                    print(row_str)
+
                 # Show coarse grid of CC values
                 print(f"\n  Coarse grid of correlation coefficient (every 10th point):")
                 for iy in range(0, out_h, grid_step):
@@ -1660,6 +1806,40 @@ class DICAnalysis:
                         else:
                             row_str += "      -"
                     print(row_str)
+
+                # Row-by-row analysis to detect horizontal banding
+                print(f"\n  Row-by-row statistics (detecting horizontal banding):")
+                print(f"    {'Row':>5} {'N':>5} {'u_mean':>8} {'u_std':>8} {'v_mean':>8} {'v_std':>8}")
+                row_stats = []
+                for iy in range(out_h):
+                    row_mask = roi_plot[iy, :]
+                    if np.any(row_mask):
+                        u_row = u_plot[iy, row_mask]
+                        v_row = v_plot[iy, row_mask]
+                        row_stats.append({
+                            'row': iy, 'n': len(u_row),
+                            'u_mean': np.mean(u_row), 'u_std': np.std(u_row),
+                            'v_mean': np.mean(v_row), 'v_std': np.std(v_row)
+                        })
+
+                # Print every 5th row
+                for i, rs in enumerate(row_stats):
+                    if i % 5 == 0:
+                        print(f"    {rs['row']:5d} {rs['n']:5d} {rs['u_mean']:8.3f} {rs['u_std']:8.4f} "
+                              f"{rs['v_mean']:8.3f} {rs['v_std']:8.4f}")
+
+                # Check for banding pattern: is v_mean systematically different between adjacent rows?
+                if len(row_stats) > 1:
+                    v_means = np.array([rs['v_mean'] for rs in row_stats])
+                    v_diffs = np.diff(v_means)
+                    print(f"\n  V-displacement row-to-row variation:")
+                    print(f"    v_mean range: {np.min(v_means):.4f} to {np.max(v_means):.4f}")
+                    print(f"    v_mean std across rows: {np.std(v_means):.4f}")
+                    print(f"    Row-to-row diff: mean={np.mean(np.abs(v_diffs)):.4f}, max={np.max(np.abs(v_diffs)):.4f}")
+
+                    # Check if there's a periodic pattern
+                    if len(v_diffs) >= 10:
+                        print(f"    First 10 row-to-row v differences: {v_diffs[:10]}")
 
                 print(f"{'='*60}")
 
