@@ -18,6 +18,7 @@ import heapq
 import numpy as np
 from numpy.typing import NDArray
 from numba import njit, prange
+from tqdm import tqdm
 
 from .bspline import (
     interpolate_subset,
@@ -1550,6 +1551,98 @@ def _process_points_parallel(
     return u_out, v_out, dudx_out, dudy_out, dvdx_out, dvdy_out, cc_out, conv_out, iter_out
 
 
+@njit(cache=True, parallel=True)
+def _process_batch_with_ncc_search(
+    ref_bcoef: NDArray[np.float64],
+    cur_bcoef: NDArray[np.float64],
+    border: int,
+    points_x: NDArray[np.int32],
+    points_y: NDArray[np.int32],
+    u_init: NDArray[np.float64],
+    v_init: NDArray[np.float64],
+    dudx_init: NDArray[np.float64],
+    dudy_init: NDArray[np.float64],
+    dvdx_init: NDArray[np.float64],
+    dvdy_init: NDArray[np.float64],
+    radius: int,
+    cutoff_diffnorm: float,
+    cutoff_iteration: int,
+    ncc_search_radius: int = 2,
+) -> Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64],
+           NDArray[np.float64], NDArray[np.float64], NDArray[np.float64],
+           NDArray[np.float64], NDArray[np.bool_], NDArray[np.int32]]:
+    """
+    Process a batch of points in parallel: NCC search + IC-GN.
+
+    For each point:
+    1. Refine initial guess with local NCC search
+    2. Run IC-GN optimization with affine warp
+
+    Args:
+        ref_bcoef, cur_bcoef: B-spline coefficients
+        border: Border size
+        points_x, points_y: Point coordinates
+        u_init, v_init: Initial displacement guesses
+        dudx_init, dudy_init, dvdx_init, dvdy_init: Initial strain guesses
+        radius: Subset radius
+        cutoff_diffnorm, cutoff_iteration: IC-GN convergence parameters
+        ncc_search_radius: Local NCC search radius (default 2)
+
+    Returns:
+        Tuple of (u, v, dudx, dudy, dvdx, dvdy, corrcoef, converged, iterations)
+    """
+    n_points = len(points_x)
+
+    u_out = np.empty(n_points, dtype=np.float64)
+    v_out = np.empty(n_points, dtype=np.float64)
+    dudx_out = np.empty(n_points, dtype=np.float64)
+    dudy_out = np.empty(n_points, dtype=np.float64)
+    dvdx_out = np.empty(n_points, dtype=np.float64)
+    dvdy_out = np.empty(n_points, dtype=np.float64)
+    cc_out = np.empty(n_points, dtype=np.float64)
+    conv_out = np.empty(n_points, dtype=np.bool_)
+    iter_out = np.empty(n_points, dtype=np.int32)
+
+    for idx in prange(n_points):
+        # Step 1: Refine initial guess with NCC search
+        u_ncc, v_ncc, ncc_val = _local_ncc_search(
+            ref_bcoef, cur_bcoef, border,
+            points_x[idx], points_y[idx], radius,
+            u_init[idx], v_init[idx],
+            ncc_search_radius,
+        )
+
+        # Use refined guess if NCC search succeeded
+        if ncc_val > 0.5:
+            u_start = u_ncc
+            v_start = v_ncc
+        else:
+            u_start = u_init[idx]
+            v_start = v_init[idx]
+
+        # Step 2: Run IC-GN with affine warp
+        u, v, dudx, dudy, dvdx, dvdy, cc, conv, n_iter = _ic_gn_affine(
+            ref_bcoef, cur_bcoef, border,
+            points_x[idx], points_y[idx], radius,
+            u_start, v_start,
+            dudx_init[idx], dudy_init[idx],
+            dvdx_init[idx], dvdy_init[idx],
+            cutoff_diffnorm, cutoff_iteration,
+        )
+
+        u_out[idx] = u
+        v_out[idx] = v
+        dudx_out[idx] = dudx
+        dudy_out[idx] = dudy
+        dvdx_out[idx] = dvdx
+        dvdy_out[idx] = dvdy
+        cc_out[idx] = cc
+        conv_out[idx] = conv
+        iter_out[idx] = n_iter
+
+    return u_out, v_out, dudx_out, dudy_out, dvdx_out, dvdy_out, cc_out, conv_out, iter_out
+
+
 # =============================================================================
 # Main DICAnalysis class
 # =============================================================================
@@ -1739,20 +1832,19 @@ class DICAnalysis:
         prev_roi: Optional[NDArray[np.bool_]] = None,
     ) -> int:
         """
-        Process a single region using flood-fill from seed.
+        Process a single region using parallel wavefront propagation.
 
-        Hybrid approach:
-        1. Priority queue (heapq) - highest correlation processed first (like MATLAB)
-        2. Affine model (6-parameter) to capture strain/deformation
-        3. Displacement jump cutoff (spacing+1 pixels)
-        4. MATLAB-identical neighbor order: top, right, bottom, left
+        Parallel batch approach:
+        1. Process seed point first
+        2. Collect all frontier points (unprocessed neighbors of processed points)
+        3. Process entire frontier in parallel using Numba prange
+        4. Filter results and add valid points
+        5. Repeat until no more frontier points
+        6. Display progress with tqdm
         """
         radius = self.params.radius
         cutoff_diffnorm = self.params.cutoff_diffnorm
         cutoff_iteration = self.params.cutoff_iteration
-
-        # Check if we have previous results to use as initial guesses
-        use_prev_result = (prev_u is not None and prev_v is not None and prev_roi is not None)
 
         # MATLAB cutoffs
         cutoff_disp = float(step)  # Displacement jump cutoff (spacing+1 in MATLAB)
@@ -1761,15 +1853,6 @@ class DICAnalysis:
         leftbound = region.leftbound
         noderange = np.asarray(region.noderange, dtype=np.int32)
         nodelist = np.asarray(region.nodelist, dtype=np.int32)
-
-        # DEBUG
-        print(f"\n{'='*60}")
-        print(f"DEBUG: Using AFFINE Model (6 parameters) for strain measurement")
-        print(f"  Seed: ({seed.x}, {seed.y}), u={seed.u:.4f}, v={seed.v:.4f}")
-        print(f"  Step: {step}, Cutoff: {cutoff_disp}")
-        print(f"  Image size: {ref_bcoef.shape}, Border: {border}")
-        print(f"  ROI leftbound: {leftbound}, noderange len: {len(noderange)}")
-        print(f"{'='*60}")
 
         # Debug counters for rejection reasons
         reject_outside_roi = 0
@@ -1798,241 +1881,153 @@ class DICAnalysis:
             print(f"WARNING: Seed failed! CC={seed_cc}")
             return 0
 
-        print(f"  Seed result: u={seed_u:.4f}, v={seed_v:.4f}, CC={seed_cc:.4f}")
-        print(f"  Seed strain: dudx={seed_dudx:.6f}, dudy={seed_dudy:.6f}, dvdx={seed_dvdx:.6f}, dvdy={seed_dvdy:.6f}")
-
-        # Priority queue: (neg_cc, insertion_order, x, y, u, v, dudx, dudy, dvdx, dvdy)
-        # Using negative CC because heapq is a min-heap
-        insertion_counter = 0
-        heap = []
-        heapq.heappush(heap, (-seed_cc, insertion_counter, seed.x, seed.y,
-                              seed_u, seed_v, seed_dudx, seed_dudy, seed_dvdx, seed_dvdy))
-        insertion_counter += 1
-
         # Track calculated points
         calc_points = np.zeros((out_h, out_w), dtype=np.bool_)
         ox_seed, oy_seed = seed.x // step, seed.y // step
         calc_points[oy_seed, ox_seed] = True
 
-        points_processed = 0
-        last_progress_percent = -1
+        # Store seed result
+        u_plot[oy_seed, ox_seed] = seed_u
+        v_plot[oy_seed, ox_seed] = seed_v
+        corrcoef_plot[oy_seed, ox_seed] = seed_cc
+        roi_plot[oy_seed, ox_seed] = True
+        converged[oy_seed, ox_seed] = True
+        dudx_field[oy_seed, ox_seed] = seed_dudx
+        dudy_field[oy_seed, ox_seed] = seed_dudy
+        dvdx_field[oy_seed, ox_seed] = seed_dvdx
+        dvdy_field[oy_seed, ox_seed] = seed_dvdy
+
+        points_processed = 1
 
         if estimated_points <= 0:
             estimated_points = region.totalpoints // (step * step) if region.totalpoints > 0 else 10000
 
-        while heap:
-            # Pop point with highest correlation
-            neg_cc, _, x, y, u, v, dudx, dudy, dvdx, dvdy = heapq.heappop(heap)
-            cc = -neg_cc
+        # Queue of points to propagate from: (x, y, u, v, dudx, dudy, dvdx, dvdy)
+        active_points = [(seed.x, seed.y, seed_u, seed_v, seed_dudx, seed_dudy, seed_dvdx, seed_dvdy)]
 
-            ox, oy = x // step, y // step
+        # Progress bar for displacement calculation
+        pbar = tqdm(total=estimated_points, desc="Displacement", unit="pts",
+                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+        pbar.update(1)  # Seed point
 
-            # Store result
-            u_plot[oy, ox] = u
-            v_plot[oy, ox] = v
-            corrcoef_plot[oy, ox] = cc
-            roi_plot[oy, ox] = True
-            converged[oy, ox] = True
-            iterations[oy, ox] = 0
+        while active_points:
+            # Collect all frontier points from active points
+            frontier = []  # List of (nx, ny, u_init, v_init, dudx_init, dudy_init, dvdx_init, dvdy_init, parent_idx)
 
-            # Store strain for propagation
-            dudx_field[oy, ox] = dudx
-            dudy_field[oy, ox] = dudy
-            dvdx_field[oy, ox] = dvdx
-            dvdy_field[oy, ox] = dvdy
+            for parent_idx, (x, y, u, v, dudx, dudy, dvdx, dvdy) in enumerate(active_points):
+                # Check neighbors - MATLAB order: top, right, bottom, left
+                for dx_step, dy_step in [(0, -step), (step, 0), (0, step), (-step, 0)]:
+                    nx, ny = x + dx_step, y + dy_step
+                    nx_out, ny_out = nx // step, ny // step
 
-            points_processed += 1
+                    if not (0 <= ny_out < out_h and 0 <= nx_out < out_w):
+                        continue
 
-            # Progress
-            current_percent = int(points_processed * 100 / max(1, estimated_points))
-            if current_percent > last_progress_percent and self._progress_callback:
-                last_progress_percent = current_percent
-                self._report_progress(min(0.99, points_processed / max(1, estimated_points)),
-                                      f"Processing... {points_processed:,} points")
+                    if calc_points[ny_out, nx_out]:
+                        continue
 
-            # Analyze neighbors - MATLAB order: top, right, bottom, left
-            for dx_step, dy_step in [(0, -step), (step, 0), (0, step), (-step, 0)]:
-                nx, ny = x + dx_step, y + dy_step
-                nx_out, ny_out = nx // step, ny // step
-
-                if not (0 <= ny_out < out_h and 0 <= nx_out < out_w):
-                    continue
-
-                if calc_points[ny_out, nx_out]:
-                    continue
-
-                if not _check_point_in_region(nx, ny, leftbound, noderange, nodelist):
+                    # Mark as being processed (to avoid duplicates in frontier)
                     calc_points[ny_out, nx_out] = True
-                    reject_outside_roi += 1
-                    continue
 
-                # Initial guess: propagate displacement using strain
-                # u_new = u + dudx * dx + dudy * dy
-                # v_new = v + dvdx * dx + dvdy * dy
-                u_init = u + dudx * dx_step + dudy * dy_step
-                v_init = v + dvdx * dx_step + dvdy * dy_step
+                    if not _check_point_in_region(nx, ny, leftbound, noderange, nodelist):
+                        reject_outside_roi += 1
+                        continue
 
-                # CRITICAL FIX: Refine initial guess using local NCC search
-                # This ensures we start IC-GN in the correct basin of attraction,
-                # preventing convergence to wrong local minima (which causes banding)
-                u_refined, v_refined, ncc_refined = _local_ncc_search(
+                    # Initial guess: propagate displacement using strain
+                    u_init = u + dudx * dx_step + dudy * dy_step
+                    v_init = v + dvdx * dx_step + dvdy * dy_step
+
+                    frontier.append((nx, ny, u_init, v_init, dudx, dudy, dvdx, dvdy))
+
+            if not frontier:
+                break
+
+            # Convert frontier to arrays for parallel processing
+            n_frontier = len(frontier)
+            points_x = np.array([f[0] for f in frontier], dtype=np.int32)
+            points_y = np.array([f[1] for f in frontier], dtype=np.int32)
+            u_init_arr = np.array([f[2] for f in frontier], dtype=np.float64)
+            v_init_arr = np.array([f[3] for f in frontier], dtype=np.float64)
+            dudx_init_arr = np.array([f[4] for f in frontier], dtype=np.float64)
+            dudy_init_arr = np.array([f[5] for f in frontier], dtype=np.float64)
+            dvdx_init_arr = np.array([f[6] for f in frontier], dtype=np.float64)
+            dvdy_init_arr = np.array([f[7] for f in frontier], dtype=np.float64)
+
+            # Process frontier in parallel (NCC search + IC-GN)
+            u_out, v_out, dudx_out, dudy_out, dvdx_out, dvdy_out, cc_out, conv_out, iter_out = \
+                _process_batch_with_ncc_search(
                     ref_bcoef, cur_bcoef, border,
-                    nx, ny, radius,
-                    u_init, v_init,
-                    search_radius=2,  # Search ±2 pixels around propagated guess
+                    points_x, points_y,
+                    u_init_arr, v_init_arr,
+                    dudx_init_arr, dudy_init_arr, dvdx_init_arr, dvdy_init_arr,
+                    radius, cutoff_diffnorm, cutoff_iteration,
+                    ncc_search_radius=2,
                 )
 
-                # Use refined guess if search was successful
-                if ncc_refined > 0.5:
-                    u_init = u_refined
-                    v_init = v_refined
-
-                # Initial strain guess: use parent's strain
-                dudx_init = dudx
-                dudy_init = dudy
-                dvdx_init = dvdx
-                dvdy_init = dvdy
-
-                # Run IC-GN with AFFINE model
-                new_u, new_v, new_dudx, new_dudy, new_dvdx, new_dvdy, new_cc, new_conv, new_iter = _ic_gn_affine(
-                    ref_bcoef, cur_bcoef, border,
-                    nx, ny, radius,
-                    u_init, v_init,
-                    dudx_init, dudy_init, dvdx_init, dvdy_init,
-                    cutoff_diffnorm, cutoff_iteration,
-                )
-
-                calc_points[ny_out, nx_out] = True
+            # Process results and collect new active points
+            new_active = []
+            for i in range(n_frontier):
+                nx, ny = points_x[i], points_y[i]
+                nx_out, ny_out = nx // step, ny // step
+                new_u, new_v = u_out[i], v_out[i]
+                new_cc = cc_out[i]
+                u_init = u_init_arr[i]
+                v_init = v_init_arr[i]
 
                 if np.isnan(new_cc):
                     reject_nan_cc += 1
-                    if reject_nan_cc <= 5:  # Print first 5 NaN rejections
-                        print(f"  NaN at ({nx}, {ny}): init=({u_init:.2f}, {v_init:.2f})")
                     continue
 
                 if new_cc < 0.0:
                     reject_low_cc += 1
-                    if reject_low_cc <= 10:  # Print first 10 low CC rejections
-                        print(f"  Low CC at ({nx}, {ny}): init=({u_init:.2f}, {v_init:.2f}), "
-                              f"result=({new_u:.2f}, {new_v:.2f}), CC={new_cc:.4f}")
                     continue
 
                 # Displacement jump cutoff
                 if abs(u_init - new_u) >= cutoff_disp or abs(v_init - new_v) >= cutoff_disp:
                     reject_disp_jump += 1
-                    if reject_disp_jump <= 5:  # Print first 5 displacement jump rejections
-                        print(f"  Disp jump at ({nx}, {ny}): init=({u_init:.2f}, {v_init:.2f}), "
-                              f"result=({new_u:.2f}, {new_v:.2f}), CC={new_cc:.4f}")
                     continue
 
-                heapq.heappush(heap, (-new_cc, insertion_counter, nx, ny,
-                                      new_u, new_v, new_dudx, new_dudy, new_dvdx, new_dvdy))
-                insertion_counter += 1
+                # Accept this point
+                u_plot[ny_out, nx_out] = new_u
+                v_plot[ny_out, nx_out] = new_v
+                corrcoef_plot[ny_out, nx_out] = new_cc
+                roi_plot[ny_out, nx_out] = True
+                converged[ny_out, nx_out] = conv_out[i]
+                iterations[ny_out, nx_out] = iter_out[i]
 
-        # Debug summary
-        print(f"\n{'='*60}")
-        print(f"DEBUG: Propagation Summary")
-        print(f"  Points processed: {points_processed}")
-        print(f"  Rejections:")
-        print(f"    Outside ROI:       {reject_outside_roi}")
-        print(f"    NaN correlation:   {reject_nan_cc}")
-        print(f"    Low correlation:   {reject_low_cc}")
-        print(f"    Displacement jump: {reject_disp_jump}")
-        print(f"{'='*60}")
+                dudx_field[ny_out, nx_out] = dudx_out[i]
+                dudy_field[ny_out, nx_out] = dudy_out[i]
+                dvdx_field[ny_out, nx_out] = dvdx_out[i]
+                dvdy_field[ny_out, nx_out] = dvdy_out[i]
 
-        # Extended debug: Show results summary and grid
+                points_processed += 1
+                new_active.append((nx, ny, new_u, new_v, dudx_out[i], dudy_out[i], dvdx_out[i], dvdy_out[i]))
+
+            # Update progress bar
+            pbar.update(len(new_active))
+
+            # Sort new_active by correlation (highest first) for better propagation order
+            # This maintains some of the priority queue behavior
+            active_points = sorted(new_active, key=lambda p: -corrcoef_plot[p[1] // step, p[0] // step])
+
+        pbar.close()
+
+        # Print summary
+        print(f"\nDisplacement calculation complete:")
+        print(f"  Points processed: {points_processed:,}")
+        print(f"  Rejections: ROI={reject_outside_roi}, NaN={reject_nan_cc}, "
+              f"LowCC={reject_low_cc}, Jump={reject_disp_jump}")
+
+        # Print displacement statistics
         if points_processed > 0:
             valid_mask = roi_plot
             if np.any(valid_mask):
                 u_valid = u_plot[valid_mask]
                 v_valid = v_plot[valid_mask]
                 cc_valid = corrcoef_plot[valid_mask]
-                dudx_valid = dudx_field[valid_mask]
-                dvdy_valid = dvdy_field[valid_mask]
-
-                print(f"\n{'='*60}")
-                print(f"DEBUG: Results Summary")
-                print(f"{'='*60}")
-                print(f"  Displacement u: min={np.min(u_valid):.4f}, max={np.max(u_valid):.4f}, "
-                      f"mean={np.mean(u_valid):.4f}, std={np.std(u_valid):.4f}")
-                print(f"  Displacement v: min={np.min(v_valid):.4f}, max={np.max(v_valid):.4f}, "
-                      f"mean={np.mean(v_valid):.4f}, std={np.std(v_valid):.4f}")
-                print(f"  Correlation CC: min={np.min(cc_valid):.4f}, max={np.max(cc_valid):.4f}, "
-                      f"mean={np.mean(cc_valid):.4f}, std={np.std(cc_valid):.4f}")
-                print(f"  Strain dudx:    min={np.min(dudx_valid):.6f}, max={np.max(dudx_valid):.6f}, "
-                      f"mean={np.mean(dudx_valid):.6f}")
-                print(f"  Strain dvdy:    min={np.min(dvdy_valid):.6f}, max={np.max(dvdy_valid):.6f}, "
-                      f"mean={np.mean(dvdy_valid):.6f}")
-
-                # Show coarse grid of u values (every 10th point)
-                print(f"\n  Coarse grid of u-displacement (every 10th point):")
-                grid_step = 10
-                for iy in range(0, out_h, grid_step):
-                    row_str = f"    y={iy:3d}: "
-                    for ix in range(0, out_w, grid_step):
-                        if roi_plot[iy, ix]:
-                            row_str += f"{u_plot[iy, ix]:7.2f}"
-                        else:
-                            row_str += "      -"
-                    print(row_str)
-
-                # Show coarse grid of v-displacement values
-                print(f"\n  Coarse grid of v-displacement (every 10th point):")
-                for iy in range(0, out_h, grid_step):
-                    row_str = f"    y={iy:3d}: "
-                    for ix in range(0, out_w, grid_step):
-                        if roi_plot[iy, ix]:
-                            row_str += f"{v_plot[iy, ix]:7.2f}"
-                        else:
-                            row_str += "      -"
-                    print(row_str)
-
-                # Show coarse grid of CC values
-                print(f"\n  Coarse grid of correlation coefficient (every 10th point):")
-                for iy in range(0, out_h, grid_step):
-                    row_str = f"    y={iy:3d}: "
-                    for ix in range(0, out_w, grid_step):
-                        if roi_plot[iy, ix]:
-                            row_str += f"{corrcoef_plot[iy, ix]:7.3f}"
-                        else:
-                            row_str += "      -"
-                    print(row_str)
-
-                # Row-by-row analysis to detect horizontal banding
-                print(f"\n  Row-by-row statistics (detecting horizontal banding):")
-                print(f"    {'Row':>5} {'N':>5} {'u_mean':>8} {'u_std':>8} {'v_mean':>8} {'v_std':>8}")
-                row_stats = []
-                for iy in range(out_h):
-                    row_mask = roi_plot[iy, :]
-                    if np.any(row_mask):
-                        u_row = u_plot[iy, row_mask]
-                        v_row = v_plot[iy, row_mask]
-                        row_stats.append({
-                            'row': iy, 'n': len(u_row),
-                            'u_mean': np.mean(u_row), 'u_std': np.std(u_row),
-                            'v_mean': np.mean(v_row), 'v_std': np.std(v_row)
-                        })
-
-                # Print every 5th row
-                for i, rs in enumerate(row_stats):
-                    if i % 5 == 0:
-                        print(f"    {rs['row']:5d} {rs['n']:5d} {rs['u_mean']:8.3f} {rs['u_std']:8.4f} "
-                              f"{rs['v_mean']:8.3f} {rs['v_std']:8.4f}")
-
-                # Check for banding pattern: is v_mean systematically different between adjacent rows?
-                if len(row_stats) > 1:
-                    v_means = np.array([rs['v_mean'] for rs in row_stats])
-                    v_diffs = np.diff(v_means)
-                    print(f"\n  V-displacement row-to-row variation:")
-                    print(f"    v_mean range: {np.min(v_means):.4f} to {np.max(v_means):.4f}")
-                    print(f"    v_mean std across rows: {np.std(v_means):.4f}")
-                    print(f"    Row-to-row diff: mean={np.mean(np.abs(v_diffs)):.4f}, max={np.max(np.abs(v_diffs)):.4f}")
-
-                    # Check if there's a periodic pattern
-                    if len(v_diffs) >= 10:
-                        print(f"    First 10 row-to-row v differences: {v_diffs[:10]}")
-
-                print(f"{'='*60}")
+                print(f"  u: [{np.min(u_valid):.3f}, {np.max(u_valid):.3f}], mean={np.mean(u_valid):.3f}")
+                print(f"  v: [{np.min(v_valid):.3f}, {np.max(v_valid):.3f}], mean={np.mean(v_valid):.3f}")
+                print(f"  CC: [{np.min(cc_valid):.4f}, {np.max(cc_valid):.4f}], mean={np.mean(cc_valid):.4f}")
 
         return points_processed
 
