@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Callable
-from collections import deque
-import heapq
+from pathlib import Path
+import datetime
 
 import numpy as np
 from numpy.typing import NDArray
@@ -1675,6 +1675,44 @@ class DICAnalysis:
         if self._progress_callback:
             self._progress_callback(progress, message)
 
+    def _save_debug_output(self, result: DICResult, image_index: int) -> None:
+        """
+        Save intermediate results for debugging.
+
+        When params.debug is True, saves displacement fields, correlation
+        coefficients, and other diagnostic data to the debug output directory.
+
+        Args:
+            result: DIC result to save
+            image_index: Index of the current image in sequence
+        """
+        if not self.params.debug:
+            return
+
+        # Create output directory
+        output_dir = Path(self.params.debug_output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate filename with timestamp
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"dic_result_{image_index:03d}_{timestamp}.npz"
+        filepath = output_dir / filename
+
+        # Save all result fields
+        np.savez_compressed(
+            filepath,
+            u=result.u,
+            v=result.v,
+            corrcoef=result.corrcoef,
+            roi=result.roi,
+            converged=result.converged,
+            iterations=result.iterations,
+            params=self.params.to_dict(),
+            image_index=image_index,
+        )
+
+        print(f"Debug output saved to: {filepath}")
+
     def analyze(
         self,
         ref_img: NcorrImage,
@@ -1703,6 +1741,9 @@ class DICAnalysis:
 
             result = self._analyze_single(ref_img, cur_img, roi, current_seeds, prev_result)
             results.append(result)
+
+            # Save debug output if enabled
+            self._save_debug_output(result, i)
 
             # Use this result as initial guess for next image
             prev_result = result

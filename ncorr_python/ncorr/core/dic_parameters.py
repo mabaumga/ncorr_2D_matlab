@@ -50,6 +50,8 @@ class DICParameters:
         pix_to_units: Pixel to physical unit conversion factor
         units: Physical unit string (e.g., 'mm', 'in')
         lens_coef: Radial lens distortion coefficient
+        debug: Enable debug mode (saves intermediate results)
+        debug_output_dir: Directory for debug output (default: './debug_output')
     """
 
     radius: int = 30
@@ -62,6 +64,8 @@ class DICParameters:
     pix_to_units: float = 1.0
     units: str = "pixels"
     lens_coef: float = 0.0
+    debug: bool = False
+    debug_output_dir: str = "./debug_output"
 
     def validate(self) -> bool:
         """
@@ -109,6 +113,8 @@ class DICParameters:
             "pix_to_units": self.pix_to_units,
             "units": self.units,
             "lens_coef": self.lens_coef,
+            "debug": self.debug,
+            "debug_output_dir": self.debug_output_dir,
         }
 
     @classmethod
@@ -133,4 +139,6 @@ class DICParameters:
             pix_to_units=d.get("pix_to_units", 1.0),
             units=d.get("units", "pixels"),
             lens_coef=d.get("lens_coef", 0.0),
+            debug=d.get("debug", False),
+            debug_output_dir=d.get("debug_output_dir", "./debug_output"),
         )

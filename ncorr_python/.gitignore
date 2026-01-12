@@ -52,5 +52,9 @@ htmlcov/
 *.json
 !pyproject.toml
 
+# Temporary/debug directories
+tmp/
+debug_output/
+
 # Numba cache
 __numba_cache__/
