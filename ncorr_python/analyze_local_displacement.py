@@ -249,6 +249,12 @@ Examples:
                         help="Number of top discontinuities to report (default: 20)")
     parser.add_argument("--save", type=str, default=None, help="Save results to NPZ file")
     parser.add_argument("--quiet", action="store_true", help="Suppress DIC debug output")
+    parser.add_argument("--remove-rigid-body", action="store_true",
+                        help="Remove rigid body motion (mean translation)")
+    parser.add_argument("--remove-trend", action="store_true",
+                        help="Remove linear trend (bending/rotation)")
+    parser.add_argument("--relative", action="store_true",
+                        help="Show relative displacement (removes both rigid body motion and linear trend)")
 
     args = parser.parse_args()
 
@@ -304,8 +310,38 @@ Examples:
     results = dic.analyze(ref_img, [cur_img], roi, seeds)
     result = results[0]
 
-    # Print displacement summary
+    # Print original displacement summary
     print_displacement_summary(result, step)
+
+    # Apply corrections if requested
+    if args.relative:
+        print("\n" + "="*70)
+        print("APPLYING CORRECTIONS: Rigid body motion + Linear trend removal")
+        print("="*70)
+        result_corrected = result.get_relative_displacement(
+            remove_translation=True, remove_trend=True
+        )
+        print("  → Rigid body motion (mean translation) removed")
+        print("  → Linear trend (bending/rotation) removed")
+        print("\nCORRECTED DISPLACEMENT SUMMARY:")
+        print_displacement_summary(result_corrected, step)
+        result = result_corrected
+
+    elif args.remove_rigid_body or args.remove_trend:
+        print("\n" + "="*70)
+        print("APPLYING CORRECTIONS")
+        print("="*70)
+
+        if args.remove_rigid_body:
+            result = result.remove_rigid_body_motion()
+            print("  → Rigid body motion (mean translation) removed")
+
+        if args.remove_trend:
+            result = result.remove_linear_trend()
+            print("  → Linear trend (bending/rotation) removed")
+
+        print("\nCORRECTED DISPLACEMENT SUMMARY:")
+        print_displacement_summary(result, step)
 
     # Compute local discontinuity
     disc = compute_local_discontinuity(result, step)

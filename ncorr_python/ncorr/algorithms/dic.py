@@ -271,6 +271,152 @@ class DICResult:
             iterations=self.iterations.copy() if self.iterations is not None else None,
         )
 
+    def remove_rigid_body_motion(self, reference_point: Optional[Tuple[int, int]] = None) -> 'DICResult':
+        """
+        Remove rigid body motion (translation) from displacement fields.
+
+        This subtracts the mean displacement (or displacement at a reference point)
+        so that only relative displacements remain.
+
+        Args:
+            reference_point: Optional (x_grid, y_grid) tuple. If provided, subtract
+                           displacement at this point. If None, subtract mean displacement.
+
+        Returns:
+            New DICResult with rigid body motion removed
+        """
+        u_corrected = self.u.copy()
+        v_corrected = self.v.copy()
+
+        if reference_point is not None:
+            # Use displacement at reference point
+            x_ref, y_ref = reference_point
+            if self.roi[y_ref, x_ref]:
+                u_offset = self.u[y_ref, x_ref]
+                v_offset = self.v[y_ref, x_ref]
+            else:
+                # Reference point not valid, fall back to mean
+                u_offset = np.nanmean(self.u[self.roi])
+                v_offset = np.nanmean(self.v[self.roi])
+        else:
+            # Use mean displacement
+            u_offset = np.nanmean(self.u[self.roi])
+            v_offset = np.nanmean(self.v[self.roi])
+
+        u_corrected = u_corrected - u_offset
+        v_corrected = v_corrected - v_offset
+
+        # Keep NaN where originally NaN
+        u_corrected[~self.roi] = np.nan
+        v_corrected[~self.roi] = np.nan
+
+        return DICResult(
+            u=u_corrected,
+            v=v_corrected,
+            corrcoef=self.corrcoef.copy(),
+            roi=self.roi.copy(),
+            seed_info=self.seed_info,
+            converged=self.converged.copy() if self.converged is not None else None,
+            iterations=self.iterations.copy() if self.iterations is not None else None,
+        )
+
+    def remove_linear_trend(self, remove_u_trend: bool = True, remove_v_trend: bool = True) -> 'DICResult':
+        """
+        Remove linear trend (plane fit) from displacement fields.
+
+        This removes global bending/rotation effects by fitting and subtracting
+        a linear plane: u = a*x + b*y + c
+
+        After this, only local deviations from the linear trend remain,
+        which is useful for detecting cracks and local strain concentrations.
+
+        Args:
+            remove_u_trend: Remove linear trend from u field (default True)
+            remove_v_trend: Remove linear trend from v field (default True)
+
+        Returns:
+            New DICResult with linear trends removed
+        """
+        u_corrected = self.u.copy()
+        v_corrected = self.v.copy()
+
+        # Get valid points
+        valid_y, valid_x = np.where(self.roi)
+
+        if len(valid_x) < 10:
+            # Not enough points for fitting
+            return self
+
+        # Fit and remove trend from u
+        if remove_u_trend:
+            u_valid = self.u[self.roi]
+
+            # Build design matrix for plane fit: u = a*x + b*y + c
+            A = np.column_stack([valid_x, valid_y, np.ones_like(valid_x)])
+
+            # Least squares fit
+            coeffs_u, _, _, _ = np.linalg.lstsq(A, u_valid, rcond=None)
+            a_u, b_u, c_u = coeffs_u
+
+            # Subtract fitted plane
+            out_h, out_w = self.u.shape
+            yy, xx = np.meshgrid(np.arange(out_h), np.arange(out_w), indexing='ij')
+            u_trend = a_u * xx + b_u * yy + c_u
+            u_corrected = self.u - u_trend
+            u_corrected[~self.roi] = np.nan
+
+        # Fit and remove trend from v
+        if remove_v_trend:
+            v_valid = self.v[self.roi]
+
+            A = np.column_stack([valid_x, valid_y, np.ones_like(valid_x)])
+            coeffs_v, _, _, _ = np.linalg.lstsq(A, v_valid, rcond=None)
+            a_v, b_v, c_v = coeffs_v
+
+            out_h, out_w = self.v.shape
+            yy, xx = np.meshgrid(np.arange(out_h), np.arange(out_w), indexing='ij')
+            v_trend = a_v * xx + b_v * yy + c_v
+            v_corrected = self.v - v_trend
+            v_corrected[~self.roi] = np.nan
+
+        return DICResult(
+            u=u_corrected,
+            v=v_corrected,
+            corrcoef=self.corrcoef.copy(),
+            roi=self.roi.copy(),
+            seed_info=self.seed_info,
+            converged=self.converged.copy() if self.converged is not None else None,
+            iterations=self.iterations.copy() if self.iterations is not None else None,
+        )
+
+    def get_relative_displacement(self, remove_translation: bool = True,
+                                   remove_trend: bool = True) -> 'DICResult':
+        """
+        Get relative displacement field with rigid body motion and trends removed.
+
+        This is a convenience method that combines:
+        1. Remove rigid body translation (mean displacement)
+        2. Remove linear trend (bending/rotation)
+
+        The result shows only LOCAL deviations - useful for crack detection.
+
+        Args:
+            remove_translation: Remove mean displacement (default True)
+            remove_trend: Remove linear trend (default True)
+
+        Returns:
+            New DICResult with corrections applied
+        """
+        result = self
+
+        if remove_translation:
+            result = result.remove_rigid_body_motion()
+
+        if remove_trend:
+            result = result.remove_linear_trend()
+
+        return result
+
 
 # =============================================================================
 # Module-level Numba-accelerated functions for IC-GN optimization
