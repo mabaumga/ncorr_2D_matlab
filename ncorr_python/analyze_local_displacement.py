@@ -85,13 +85,14 @@ def compute_local_discontinuity(result: DICResult, step: int) -> dict:
     }
 
 
-def find_discontinuities(disc: dict, threshold: float = 1.0) -> list:
+def find_discontinuities(disc: dict, threshold: float = 1.0, margin: int = 0) -> list:
     """
     Find locations where displacement discontinuity exceeds threshold.
 
     Args:
         disc: Dictionary from compute_local_discontinuity
         threshold: Minimum jump in pixels to report
+        margin: Number of grid points to exclude from edges (to avoid edge effects)
 
     Returns:
         List of (x_grid, y_grid, delta_u, delta_v, direction) tuples
@@ -106,9 +107,15 @@ def find_discontinuities(disc: dict, threshold: float = 1.0) -> list:
 
     h, w = delta_u_x.shape
 
+    # Define valid range excluding edge margin
+    y_min = margin
+    y_max = h - margin
+    x_min = margin
+    x_max = w - margin
+
     # Check horizontal jumps (x-direction)
-    for iy in range(h):
-        for ix in range(w - 1):
+    for iy in range(y_min, y_max):
+        for ix in range(max(x_min, 0), min(x_max, w - 1)):
             dux = delta_u_x[iy, ix]
             dvx = delta_v_x[iy, ix]
             if not (np.isnan(dux) or np.isnan(dvx)):
@@ -126,8 +133,8 @@ def find_discontinuities(disc: dict, threshold: float = 1.0) -> list:
                     })
 
     # Check vertical jumps (y-direction)
-    for iy in range(h - 1):
-        for ix in range(w):
+    for iy in range(max(y_min, 0), min(y_max, h - 1)):
+        for ix in range(x_min, x_max):
             duy = delta_u_y[iy, ix]
             dvy = delta_v_y[iy, ix]
             if not (np.isnan(duy) or np.isnan(dvy)):
@@ -247,6 +254,8 @@ Examples:
                         help="Threshold for reporting discontinuities in pixels (default: 0.5)")
     parser.add_argument("--top", type=int, default=20,
                         help="Number of top discontinuities to report (default: 20)")
+    parser.add_argument("--margin", type=int, default=5,
+                        help="Edge margin in grid points to exclude (avoid edge effects, default: 5)")
     parser.add_argument("--save", type=str, default=None, help="Save results to NPZ file")
     parser.add_argument("--quiet", action="store_true", help="Suppress DIC debug output")
     parser.add_argument("--remove-rigid-body", action="store_true",
@@ -347,17 +356,22 @@ Examples:
     disc = compute_local_discontinuity(result, step)
     print_discontinuity_summary(disc)
 
-    # Find and report large discontinuities
-    discontinuities = find_discontinuities(disc, threshold=args.threshold)
+    # Find and report large discontinuities (excluding edge effects)
+    discontinuities = find_discontinuities(disc, threshold=args.threshold, margin=args.margin)
 
     print("\n" + "="*70)
-    print(f"DETECTED DISCONTINUITIES (threshold >= {args.threshold} pixels)")
+    print(f"DETECTED DISCONTINUITIES (threshold >= {args.threshold} pixels, margin={args.margin} grid points)")
     print("="*70)
+
+    # Calculate excluded pixel range for info
+    margin_pixels = args.margin * step
 
     if not discontinuities:
         print(f"  No discontinuities >= {args.threshold} pixels detected")
+        print(f"  (Edge margin: {args.margin} grid points = {margin_pixels} pixels excluded from each edge)")
     else:
         print(f"  Found {len(discontinuities)} locations with jump >= {args.threshold} pixels")
+        print(f"  (Edge margin: {args.margin} grid points = {margin_pixels} pixels excluded from each edge)")
         print(f"\n  Top {min(args.top, len(discontinuities))} largest jumps:")
         print(f"  {'#':>3} {'X_pixel':>8} {'Y_pixel':>8} {'Δu':>8} {'Δv':>8} {'|Δ|':>8} {'Direction':>12}")
         print(f"  {'-'*3} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*12}")
@@ -405,6 +419,8 @@ Examples:
     print(f"  - 'horizontal' direction = vertical crack (jump when moving →)")
     print(f"  - 'vertical' direction = horizontal crack (jump when moving ↓)")
     print(f"  - The discontinuity is measured over {step} pixels (grid spacing)")
+    print(f"  - Edge margin of {args.margin} grid points excludes boundary artifacts")
+    print(f"    (Use --margin 0 to include edges, --margin N to adjust)")
 
 
 if __name__ == "__main__":
