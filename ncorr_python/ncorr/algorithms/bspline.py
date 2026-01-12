@@ -25,47 +25,76 @@ def _quintic_bspline(t: float) -> float:
     Evaluate quintic B-spline basis function at t.
 
     The quintic B-spline is defined over [-3, 3] and is zero outside.
-    """
-    t = abs(t)
 
-    if t >= 3.0:
+    This uses the standard centered quintic B-spline that satisfies:
+    - B(0) = 11/20 = 0.55
+    - B(1) = 13/60 ≈ 0.217
+    - B(2) = 1/120 ≈ 0.00833
+    - Sum over all integers = 1 (partition of unity)
+
+    Derived from: B_5(x) = sum_{k=0}^{6} C(6,k) * (-1)^k * max(x-k+3, 0)^5 / 120
+    """
+    at = abs(t)
+
+    if at >= 3.0:
         return 0.0
-    elif t >= 2.0:
-        tmp = 3.0 - t
+    elif at >= 2.0:
+        # (3-|t|)^5 / 120
+        tmp = 3.0 - at
         return tmp * tmp * tmp * tmp * tmp / 120.0
-    elif t >= 1.0:
-        t2 = t * t
-        t3 = t2 * t
-        t4 = t3 * t
-        t5 = t4 * t
-        return (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t + 1215.0) / 120.0
+    elif at >= 1.0:
+        # Correct formula for 1 <= |t| < 2:
+        # B(t) = (5|t|^5 - 45|t|^4 + 150|t|^3 - 210|t|^2 + 75|t| + 51) / 120
+        # Verified: B(1) = (5-45+150-210+75+51)/120 = 26/120 = 13/60 ✓
+        t2 = at * at
+        t3 = t2 * at
+        t4 = t3 * at
+        t5 = t4 * at
+        return (5.0 * t5 - 45.0 * t4 + 150.0 * t3 - 210.0 * t2 + 75.0 * at + 51.0) / 120.0
     else:
-        t2 = t * t
+        # |t| < 1: B(t) = (66 - 60t^2 + 30t^4 - 10|t|^5) / 120
+        # Verified: B(0) = 66/120 = 11/20 ✓
+        #           B(1-) = (66-60+30-10)/120 = 26/120 = 13/60 ✓ (continuous!)
+        t2 = at * at
         t4 = t2 * t2
-        return (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
+        t5 = t4 * at
+        return (66.0 - 60.0 * t2 + 30.0 * t4 - 10.0 * t5) / 120.0
 
 
 @njit(cache=True, fastmath=True)
 def _quintic_bspline_derivative(t: float) -> float:
     """
     Evaluate derivative of quintic B-spline basis function at t.
+
+    Derivatives of the corrected B-spline formulas:
+    - |t| < 1: d/dt[(66 - 60t² + 30t⁴ - 10|t|⁵)/120] = sign(t)*(-120|t| + 120|t|³ - 50|t|⁴)/120
+    - 1 <= |t| < 2: d/dt[(5|t|⁵ - 45|t|⁴ + 150|t|³ - 210|t|² + 75|t| + 51)/120]
+                  = sign(t)*(25|t|⁴ - 180|t|³ + 450|t|² - 420|t| + 75)/120
+    - 2 <= |t| < 3: d/dt[(3-|t|)⁵/120] = -sign(t)*(3-|t|)⁴/24
     """
     sign = 1.0 if t >= 0.0 else -1.0
-    t = abs(t)
+    at = abs(t)
 
-    if t >= 3.0:
+    if at >= 3.0:
         return 0.0
-    elif t >= 2.0:
-        tmp = 3.0 - t
+    elif at >= 2.0:
+        # d/dt[(3-|t|)^5/120] = -sign(t) * 5*(3-|t|)^4 / 120 = -sign(t) * (3-|t|)^4 / 24
+        tmp = 3.0 - at
         return -sign * tmp * tmp * tmp * tmp / 24.0
-    elif t >= 1.0:
-        t2 = t * t
-        t3 = t2 * t
-        t4 = t3 * t
-        return sign * (-25.0 * t4 + 300.0 * t3 - 1350.0 * t2 + 2700.0 * t - 2025.0) / 120.0
+    elif at >= 1.0:
+        # d/dt[(5|t|^5 - 45|t|^4 + 150|t|^3 - 210|t|^2 + 75|t| + 51)/120]
+        # = sign(t) * (25|t|^4 - 180|t|^3 + 450|t|^2 - 420|t| + 75) / 120
+        t2 = at * at
+        t3 = t2 * at
+        t4 = t3 * at
+        return sign * (25.0 * t4 - 180.0 * t3 + 450.0 * t2 - 420.0 * at + 75.0) / 120.0
     else:
-        t3 = t * t * t
-        return sign * (-60.0 * t + 20.0 * t3) / 60.0
+        # d/dt[(66 - 60t^2 + 30t^4 - 10|t|^5)/120]
+        # = sign(t) * (-120|t| + 120|t|^3 - 50|t|^4) / 120
+        t2 = at * at
+        t3 = t2 * at
+        t4 = t3 * at
+        return sign * (-120.0 * at + 120.0 * t3 - 50.0 * t4) / 120.0
 
 
 @njit(cache=True, fastmath=True)

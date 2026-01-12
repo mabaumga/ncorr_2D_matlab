@@ -424,7 +424,11 @@ class DICResult:
 
 @njit(cache=True, fastmath=True)
 def _bspline_interp(px: float, py: float, bcoef: NDArray[np.float64]) -> float:
-    """Inline B-spline interpolation for a single point (value only)."""
+    """Inline B-spline interpolation for a single point (value only).
+
+    Uses the CORRECT quintic B-spline basis functions that satisfy
+    the partition of unity property (sum of basis functions = 1).
+    """
     h, w = bcoef.shape
     if px < 2.0 or px >= w - 3.0 or py < 2.0 or py >= h - 3.0:
         return np.nan
@@ -440,36 +444,44 @@ def _bspline_interp(px: float, py: float, bcoef: NDArray[np.float64]) -> float:
         if t_y >= 3.0:
             by = 0.0
         elif t_y >= 2.0:
+            # (3-|t|)^5 / 120
             tmp = 3.0 - t_y
             by = tmp * tmp * tmp * tmp * tmp / 120.0
         elif t_y >= 1.0:
+            # (5|t|^5 - 45|t|^4 + 150|t|^3 - 210|t|^2 + 75|t| + 51) / 120
             t2 = t_y * t_y
             t3 = t2 * t_y
             t4 = t3 * t_y
             t5 = t4 * t_y
-            by = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_y + 1215.0) / 120.0
+            by = (5.0 * t5 - 45.0 * t4 + 150.0 * t3 - 210.0 * t2 + 75.0 * t_y + 51.0) / 120.0
         else:
+            # (66 - 60*t^2 + 30*t^4 - 10*|t|^5) / 120
             t2 = t_y * t_y
             t4 = t2 * t2
-            by = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
+            t5 = t4 * t_y
+            by = (66.0 - 60.0 * t2 + 30.0 * t4 - 10.0 * t5) / 120.0
 
         for ii in range(-2, 4):
             t_x = abs(fx - ii)
             if t_x >= 3.0:
                 bx = 0.0
             elif t_x >= 2.0:
+                # (3-|t|)^5 / 120
                 tmp = 3.0 - t_x
                 bx = tmp * tmp * tmp * tmp * tmp / 120.0
             elif t_x >= 1.0:
+                # (5|t|^5 - 45|t|^4 + 150|t|^3 - 210|t|^2 + 75|t| + 51) / 120
                 t2 = t_x * t_x
                 t3 = t2 * t_x
                 t4 = t3 * t_x
                 t5 = t4 * t_x
-                bx = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_x + 1215.0) / 120.0
+                bx = (5.0 * t5 - 45.0 * t4 + 150.0 * t3 - 210.0 * t2 + 75.0 * t_x + 51.0) / 120.0
             else:
+                # (66 - 60*t^2 + 30*t^4 - 10*|t|^5) / 120
                 t2 = t_x * t_x
                 t4 = t2 * t2
-                bx = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
+                t5 = t4 * t_x
+                bx = (66.0 - 60.0 * t2 + 30.0 * t4 - 10.0 * t5) / 120.0
 
             value += bcoef[iy + jj, ix + ii] * bx * by
 
@@ -480,7 +492,11 @@ def _bspline_interp(px: float, py: float, bcoef: NDArray[np.float64]) -> float:
 def _bspline_interp_with_grad(
     px: float, py: float, bcoef: NDArray[np.float64]
 ) -> Tuple[float, float, float]:
-    """Inline B-spline interpolation with gradients."""
+    """Inline B-spline interpolation with gradients.
+
+    Uses the CORRECT quintic B-spline basis functions and derivatives
+    that satisfy the partition of unity property.
+    """
     h, w = bcoef.shape
     if px < 2.0 or px >= w - 3.0 or py < 2.0 or py >= h - 3.0:
         return np.nan, np.nan, np.nan
@@ -500,22 +516,29 @@ def _bspline_interp_with_grad(
             by = 0.0
             dby = 0.0
         elif t_y >= 2.0:
+            # B(t) = (3-|t|)^5 / 120
+            # B'(t) = -sign(t) * (3-|t|)^4 / 24
             tmp = 3.0 - t_y
             by = tmp * tmp * tmp * tmp * tmp / 120.0
             dby = -tmp * tmp * tmp * tmp / 24.0
         elif t_y >= 1.0:
+            # B(t) = (5|t|^5 - 45|t|^4 + 150|t|^3 - 210|t|^2 + 75|t| + 51) / 120
+            # B'(t) = sign(t) * (25|t|^4 - 180|t|^3 + 450|t|^2 - 420|t| + 75) / 120
             t2 = t_y * t_y
             t3 = t2 * t_y
             t4 = t3 * t_y
             t5 = t4 * t_y
-            by = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_y + 1215.0) / 120.0
-            dby = (-25.0 * t4 + 300.0 * t3 - 1350.0 * t2 + 2700.0 * t_y - 2025.0) / 120.0
+            by = (5.0 * t5 - 45.0 * t4 + 150.0 * t3 - 210.0 * t2 + 75.0 * t_y + 51.0) / 120.0
+            dby = (25.0 * t4 - 180.0 * t3 + 450.0 * t2 - 420.0 * t_y + 75.0) / 120.0
         else:
+            # B(t) = (66 - 60*t^2 + 30*t^4 - 10*|t|^5) / 120
+            # B'(t) = (-120*|t| + 120*|t|^3 - 50*|t|^4) / 120 (before sign adjustment)
             t2 = t_y * t_y
-            t4 = t2 * t2
-            by = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
             t3 = t2 * t_y
-            dby = (-60.0 * t_y + 20.0 * t3) / 60.0
+            t4 = t2 * t2
+            t5 = t4 * t_y
+            by = (66.0 - 60.0 * t2 + 30.0 * t4 - 10.0 * t5) / 120.0
+            dby = (-120.0 * t_y + 120.0 * t3 - 50.0 * t4) / 120.0
 
         if (fy - jj) < 0:
             dby = -dby
@@ -526,22 +549,29 @@ def _bspline_interp_with_grad(
                 bx = 0.0
                 dbx = 0.0
             elif t_x >= 2.0:
+                # B(t) = (3-|t|)^5 / 120
+                # B'(t) = -sign(t) * (3-|t|)^4 / 24
                 tmp = 3.0 - t_x
                 bx = tmp * tmp * tmp * tmp * tmp / 120.0
                 dbx = -tmp * tmp * tmp * tmp / 24.0
             elif t_x >= 1.0:
+                # B(t) = (5|t|^5 - 45|t|^4 + 150|t|^3 - 210|t|^2 + 75|t| + 51) / 120
+                # B'(t) = sign(t) * (25|t|^4 - 180|t|^3 + 450|t|^2 - 420|t| + 75) / 120
                 t2 = t_x * t_x
                 t3 = t2 * t_x
                 t4 = t3 * t_x
                 t5 = t4 * t_x
-                bx = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_x + 1215.0) / 120.0
-                dbx = (-25.0 * t4 + 300.0 * t3 - 1350.0 * t2 + 2700.0 * t_x - 2025.0) / 120.0
+                bx = (5.0 * t5 - 45.0 * t4 + 150.0 * t3 - 210.0 * t2 + 75.0 * t_x + 51.0) / 120.0
+                dbx = (25.0 * t4 - 180.0 * t3 + 450.0 * t2 - 420.0 * t_x + 75.0) / 120.0
             else:
+                # B(t) = (66 - 60*t^2 + 30*t^4 - 10*|t|^5) / 120
+                # B'(t) = (-120*|t| + 120*|t|^3 - 50*|t|^4) / 120 (before sign adjustment)
                 t2 = t_x * t_x
-                t4 = t2 * t2
-                bx = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
                 t3 = t2 * t_x
-                dbx = (-60.0 * t_x + 20.0 * t3) / 60.0
+                t4 = t2 * t2
+                t5 = t4 * t_x
+                bx = (66.0 - 60.0 * t2 + 30.0 * t4 - 10.0 * t5) / 120.0
+                dbx = (-120.0 * t_x + 120.0 * t3 - 50.0 * t4) / 120.0
 
             if (fx - ii) < 0:
                 dbx = -dbx
@@ -1841,6 +1871,21 @@ class DICAnalysis:
                 # v_new = v + dvdx * dx + dvdy * dy
                 u_init = u + dudx * dx_step + dudy * dy_step
                 v_init = v + dvdx * dx_step + dvdy * dy_step
+
+                # CRITICAL FIX: Refine initial guess using local NCC search
+                # This ensures we start IC-GN in the correct basin of attraction,
+                # preventing convergence to wrong local minima (which causes banding)
+                u_refined, v_refined, ncc_refined = _local_ncc_search(
+                    ref_bcoef, cur_bcoef, border,
+                    nx, ny, radius,
+                    u_init, v_init,
+                    search_radius=2,  # Search ±2 pixels around propagated guess
+                )
+
+                # Use refined guess if search was successful
+                if ncc_refined > 0.5:
+                    u_init = u_refined
+                    v_init = v_refined
 
                 # Initial strain guess: use parent's strain
                 dudx_init = dudx
