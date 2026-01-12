@@ -15,13 +15,16 @@ from .core.roi import NcorrROI, Region, Boundary
 from .core.dic_parameters import DICParameters
 from .algorithms.bspline import BSplineInterpolator
 from .algorithms.dic import DICAnalysis
-from .algorithms.strain import StrainCalculator
+from .algorithms.strain import StrainCalculator, StrainResult
 from .algorithms.regions import RegionProcessor
+from .main import Ncorr, AnalysisResults
 
 __version__ = "2.0.0"
 __author__ = "Ncorr Python Translation"
 
 __all__ = [
+    "Ncorr",
+    "AnalysisResults",
     "Status",
     "NcorrImage",
     "NcorrROI",
@@ -31,5 +34,6 @@ __all__ = [
     "BSplineInterpolator",
     "DICAnalysis",
     "StrainCalculator",
+    "StrainResult",
     "RegionProcessor",
 ]
