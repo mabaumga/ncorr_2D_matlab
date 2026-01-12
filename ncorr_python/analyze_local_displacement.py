@@ -92,7 +92,7 @@ def find_discontinuities(disc: dict, threshold: float = 1.0, margin: int = 0) ->
     Args:
         disc: Dictionary from compute_local_discontinuity
         threshold: Minimum jump in pixels to report
-        margin: Number of grid points to exclude from edges (to avoid edge effects)
+        margin: Number of grid points to exclude from ROI edges (to avoid edge effects)
 
     Returns:
         List of (x_grid, y_grid, delta_u, delta_v, direction) tuples
@@ -104,18 +104,37 @@ def find_discontinuities(disc: dict, threshold: float = 1.0, margin: int = 0) ->
     delta_v_x = disc['delta_v_x']
     delta_u_y = disc['delta_u_y']
     delta_v_y = disc['delta_v_y']
+    delta_total = disc['delta_total']
 
     h, w = delta_u_x.shape
 
-    # Define valid range excluding edge margin
-    y_min = margin
-    y_max = h - margin
-    x_min = margin
-    x_max = w - margin
+    # Find the VALID region (where we have actual data, not NaN)
+    # This is important because the ROI doesn't start at grid index 0
+    valid_mask = ~np.isnan(delta_total)
+    valid_rows = np.any(valid_mask, axis=1)
+    valid_cols = np.any(valid_mask, axis=0)
+
+    # Find first and last valid row/column
+    valid_row_indices = np.where(valid_rows)[0]
+    valid_col_indices = np.where(valid_cols)[0]
+
+    if len(valid_row_indices) == 0 or len(valid_col_indices) == 0:
+        return results  # No valid data
+
+    first_valid_row = valid_row_indices[0]
+    last_valid_row = valid_row_indices[-1]
+    first_valid_col = valid_col_indices[0]
+    last_valid_col = valid_col_indices[-1]
+
+    # Apply margin relative to the VALID region, not the grid boundaries
+    y_min = first_valid_row + margin
+    y_max = last_valid_row - margin + 1  # +1 because range is exclusive
+    x_min = first_valid_col + margin
+    x_max = last_valid_col - margin + 1
 
     # Check horizontal jumps (x-direction)
     for iy in range(y_min, y_max):
-        for ix in range(max(x_min, 0), min(x_max, w - 1)):
+        for ix in range(x_min, min(x_max, w - 1)):
             dux = delta_u_x[iy, ix]
             dvx = delta_v_x[iy, ix]
             if not (np.isnan(dux) or np.isnan(dvx)):
@@ -133,7 +152,7 @@ def find_discontinuities(disc: dict, threshold: float = 1.0, margin: int = 0) ->
                     })
 
     # Check vertical jumps (y-direction)
-    for iy in range(max(y_min, 0), min(y_max, h - 1)):
+    for iy in range(y_min, min(y_max, h - 1)):
         for ix in range(x_min, x_max):
             duy = delta_u_y[iy, ix]
             dvy = delta_v_y[iy, ix]
@@ -359,6 +378,20 @@ Examples:
     # Find and report large discontinuities (excluding edge effects)
     discontinuities = find_discontinuities(disc, threshold=args.threshold, margin=args.margin)
 
+    # Calculate actual excluded range for display
+    delta_total = disc['delta_total']
+    valid_mask = ~np.isnan(delta_total)
+    valid_rows = np.any(valid_mask, axis=1)
+    valid_row_indices = np.where(valid_rows)[0]
+    if len(valid_row_indices) > 0:
+        first_valid_row = valid_row_indices[0]
+        last_valid_row = valid_row_indices[-1]
+        first_included_row = first_valid_row + args.margin
+        last_included_row = last_valid_row - args.margin
+    else:
+        first_included_row = 0
+        last_included_row = 0
+
     print("\n" + "="*70)
     print(f"DETECTED DISCONTINUITIES (threshold >= {args.threshold} pixels, margin={args.margin} grid points)")
     print("="*70)
@@ -368,10 +401,12 @@ Examples:
 
     if not discontinuities:
         print(f"  No discontinuities >= {args.threshold} pixels detected")
-        print(f"  (Edge margin: {args.margin} grid points = {margin_pixels} pixels excluded from each edge)")
+        print(f"  (Edge margin: {args.margin} grid points from ROI boundary)")
+        print(f"  (Y range: {first_included_row * step} to {last_included_row * step} pixels)")
     else:
         print(f"  Found {len(discontinuities)} locations with jump >= {args.threshold} pixels")
-        print(f"  (Edge margin: {args.margin} grid points = {margin_pixels} pixels excluded from each edge)")
+        print(f"  (Edge margin: {args.margin} grid points from ROI boundary)")
+        print(f"  (Y range: {first_included_row * step} to {last_included_row * step} pixels)")
         print(f"\n  Top {min(args.top, len(discontinuities))} largest jumps:")
         print(f"  {'#':>3} {'X_pixel':>8} {'Y_pixel':>8} {'Δu':>8} {'Δv':>8} {'|Δ|':>8} {'Direction':>12}")
         print(f"  {'-'*3} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*12}")
