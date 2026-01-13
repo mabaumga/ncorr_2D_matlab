@@ -381,7 +381,7 @@ def create_refined_crack_analysis(
     crack_y_min_idx = max(0, int(crack_y_min_px / grid_step) - crack_margin_idx)
     crack_y_max_idx = min(ny - 1, int(crack_y_max_px / grid_step) + crack_margin_idx)
 
-    print(f"Detected crack region: y = {y_coords[crack_y_min_idx]:.1f} to {y_coords[crack_y_max_idx]:.1f} {coord_unit}")
+    print(f"Detected crack region: y = {y_coords[crack_y_min_idx]:.0f} to {y_coords[crack_y_max_idx]:.0f} px")
 
     # =========================================================================
     # Step 3: Compute refined data (average in crack region instead of max)
