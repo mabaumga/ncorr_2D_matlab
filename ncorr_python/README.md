@@ -4,7 +4,7 @@ A Python translation of the Ncorr 2D Digital Image Correlation (DIC) software.
 
 ## Overview
 
-Ncorr is an open-source 2D Digital Image Correlation (DIC) software that enables measurement of full-field deformation and strain from digital images. This Python version is a complete translation of the original MATLAB implementation.
+Ncorr is an open-source 2D Digital Image Correlation (DIC) software that enables measurement of full-field deformation and strain from digital images. This Python version is a complete translation of the original MATLAB implementation with additional optimizations.
 
 **Reference:**
 > Ncorr: open-source 2D digital image correlation matlab software
@@ -14,11 +14,14 @@ Ncorr is an open-source 2D Digital Image Correlation (DIC) software that enables
 ## Features
 
 - **Digital Image Correlation (DIC)**: Measure displacements between reference and deformed images
+- **IC-GN Algorithm**: Inverse Compositional Gauss-Newton with affine warp model (6-parameter)
 - **Strain Calculation**: Compute Green-Lagrange and Eulerian-Almansi strains
 - **Region of Interest (ROI)**: Define analysis regions via masks
 - **B-spline Interpolation**: Subpixel accuracy using biquintic B-splines
 - **Multi-image Analysis**: Process image sequences with step analysis
-- **Performance**: Optimized with NumPy and Numba JIT compilation
+- **Parallel Processing**: Batch parallel processing using Numba prange
+- **Progress Display**: tqdm progress bars for displacement calculation
+- **Debug Mode**: Save intermediate results for debugging
 
 ## Installation
 
@@ -63,6 +66,21 @@ for i, disp in enumerate(results.displacements):
     print(f"Image {i}: u_mean={disp.u[disp.roi].mean():.3f}")
 ```
 
+## Debug Mode
+
+Enable debug mode to save intermediate results:
+
+```python
+params = DICParameters(
+    radius=30,
+    spacing=5,
+    debug=True,                      # Enable debug output
+    debug_output_dir="./debug_output"  # Output directory
+)
+
+# Results will be saved as .npz files after each image analysis
+```
+
 ## Project Structure
 
 ```
@@ -74,22 +92,25 @@ ncorr_python/
 │   │   ├── status.py          # Status enumeration
 │   │   ├── image.py           # NcorrImage class
 │   │   ├── roi.py             # NcorrROI class
-│   │   └── dic_parameters.py  # DIC parameters
+│   │   └── dic_parameters.py  # DIC parameters (incl. debug flag)
 │   ├── algorithms/
 │   │   ├── bspline.py         # B-spline interpolation
-│   │   ├── dic.py             # DIC analysis
+│   │   ├── dic.py             # DIC analysis (parallel processing)
 │   │   ├── strain.py          # Strain calculation
 │   │   ├── seeds.py           # Seed calculation
 │   │   └── regions.py         # Region processing
 │   └── utils/
-│       ├── image_loader.py    # Image loading
-│       ├── validation.py      # Parameter validation
-│       └── colormaps.py       # Visualization
+│       └── ...
 ├── tests/
+│   ├── conftest.py            # Test fixtures (speckle patterns)
 │   ├── test_core.py
 │   ├── test_algorithms.py
 │   ├── test_main.py
 │   └── test_utils.py
+├── examples/
+│   ├── dic_analysis_example.py
+│   └── test_tensile.py        # Synthetic tensile test
+├── tmp/                        # Temporary/debug scripts
 └── pyproject.toml
 ```
 
@@ -138,13 +159,15 @@ params = DICParameters(
     cutoff_diffnorm=1e-3,   # Convergence tolerance
     cutoff_iteration=30,    # Max iterations
     subset_trunc=False,     # Subset truncation
+    debug=False,            # Debug mode (saves intermediate results)
+    debug_output_dir="./debug_output",
 )
 ```
 
 ## Algorithms
 
 ### DIC Analysis
-The core DIC algorithm uses Inverse Compositional Gauss-Newton (IC-GN) optimization:
+The core DIC algorithm uses Inverse Compositional Gauss-Newton (IC-GN) optimization with affine warp (6 parameters: u, v, dudx, dudy, dvdx, dvdy):
 
 ```python
 from ncorr.algorithms.dic import DICAnalysis, SeedInfo
@@ -155,8 +178,24 @@ dic = DICAnalysis(params)
 # Define seeds (initial guesses)
 seeds = [SeedInfo(x=100, y=100, u=0, v=0, region_idx=0, valid=True)]
 
-# Run analysis
+# Run analysis (shows tqdm progress bar)
 results = dic.analyze(ref_img, cur_imgs, roi, seeds)
+```
+
+### DIC Result Processing
+
+```python
+# Get result for first image
+result = results[0]
+
+# Remove rigid body motion (mean translation)
+result_corrected = result.remove_rigid_body_motion()
+
+# Remove linear trend (bending/rotation)
+result_corrected = result.remove_linear_trend()
+
+# Get relative displacement (removes both)
+result_relative = result.get_relative_displacement()
 ```
 
 ### Strain Calculation
@@ -189,7 +228,7 @@ pytest
 pytest --cov=ncorr
 
 # Run specific tests
-pytest tests/test_core.py -v
+pytest tests/test_algorithms.py -v -k "bspline"
 ```
 
 ## Dependencies
@@ -201,6 +240,16 @@ pytest tests/test_core.py -v
 - Numba >= 0.55
 - OpenCV >= 4.5
 - Matplotlib >= 3.5
+- tqdm >= 4.60
+
+## Performance
+
+The implementation uses several optimization techniques:
+
+1. **Numba JIT Compilation**: All core algorithms are compiled with Numba
+2. **Parallel Processing**: Batch processing of frontier points using `prange`
+3. **B-spline Caching**: Precomputed B-spline coefficients for fast interpolation
+4. **Local NCC Search**: Initial guess refinement prevents convergence to wrong minima
 
 ## Differences from MATLAB Version
 
@@ -208,6 +257,7 @@ pytest tests/test_core.py -v
 2. **No GUI by default**: Programmatic API only (GUI can be added with PyQt6)
 3. **NumPy arrays**: Uses NumPy instead of MATLAB matrices
 4. **Python idioms**: Uses dataclasses, type hints, and Pythonic patterns
+5. **tqdm Progress**: Visual progress bars during analysis
 
 ## License
 

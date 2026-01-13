@@ -53,6 +53,37 @@ def sample_speckle_pattern():
 
 
 @pytest.fixture
+def realistic_speckle_pattern():
+    """Create a realistic speckle pattern using Gaussian-filtered noise.
+
+    This creates patterns similar to real spray-painted speckle patterns
+    used in DIC experiments.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    np.random.seed(42)
+    width, height = 400, 200
+    speckle_size = 3
+
+    # Start with random noise
+    pattern = np.random.rand(height, width).astype(np.float64)
+
+    # Apply Gaussian blur to create speckle-like texture
+    pattern = gaussian_filter(pattern, sigma=speckle_size)
+
+    # Enhance contrast
+    pattern = (pattern - pattern.min()) / (pattern.max() - pattern.min())
+
+    # Add some fine noise for texture
+    fine_noise = np.random.rand(height, width) * 0.1
+    pattern = pattern * 0.9 + fine_noise
+
+    # Final normalization to 0-255
+    pattern = (pattern - pattern.min()) / (pattern.max() - pattern.min())
+    return (pattern * 255).astype(np.uint8)
+
+
+@pytest.fixture
 def displaced_speckle_pattern(sample_speckle_pattern):
     """Create a displaced version of the speckle pattern."""
     from scipy.ndimage import shift

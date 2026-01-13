@@ -12,11 +12,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Callable
-from collections import deque
+from pathlib import Path
+import datetime
 
 import numpy as np
 from numpy.typing import NDArray
 from numba import njit, prange
+from tqdm import tqdm
 
 from .bspline import (
     interpolate_subset,
@@ -135,6 +137,287 @@ class DICResult:
             print(f"  Max:                    {diag['iterations_max']}")
         print("=" * 50)
 
+    def analyze_row_banding(self) -> dict:
+        """
+        Analyze horizontal banding artifacts in the v-displacement field.
+
+        Returns:
+            Dictionary with banding statistics
+        """
+        out_h, out_w = self.u.shape
+
+        # Collect per-row statistics
+        row_v_means = []
+        row_u_means = []
+
+        for iy in range(out_h):
+            row_mask = self.roi[iy, :]
+            if np.any(row_mask):
+                row_v_means.append(np.mean(self.v[iy, row_mask]))
+                row_u_means.append(np.mean(self.u[iy, row_mask]))
+
+        if len(row_v_means) < 2:
+            return {"error": "Not enough rows for banding analysis"}
+
+        v_means = np.array(row_v_means)
+        u_means = np.array(row_u_means)
+        v_diffs = np.diff(v_means)
+        u_diffs = np.diff(u_means)
+
+        return {
+            "v_row_std": float(np.std(v_means)),
+            "v_row_range": float(np.max(v_means) - np.min(v_means)),
+            "v_row_to_row_mean": float(np.mean(np.abs(v_diffs))),
+            "v_row_to_row_max": float(np.max(np.abs(v_diffs))),
+            "u_row_std": float(np.std(u_means)),
+            "u_row_to_row_mean": float(np.mean(np.abs(u_diffs))),
+            "banding_detected": float(np.std(v_means)) > 0.5,  # Threshold for banding
+        }
+
+    def smooth_row_banding(self, window_size: int = 5) -> 'DICResult':
+        """
+        Smooth horizontal banding artifacts in the v-displacement field.
+
+        This applies a median filter along the y-direction to reduce row-to-row
+        variations while preserving the overall displacement pattern.
+
+        Args:
+            window_size: Size of the median filter window (must be odd, default 5)
+
+        Returns:
+            New DICResult with smoothed v-field
+        """
+        from scipy.ndimage import median_filter
+
+        # Ensure window size is odd
+        if window_size % 2 == 0:
+            window_size += 1
+
+        # Create a copy of v
+        v_smoothed = self.v.copy()
+
+        # Apply 1D median filter along y-direction for each column
+        out_h, out_w = self.v.shape
+
+        for ix in range(out_w):
+            col_mask = self.roi[:, ix]
+            if np.sum(col_mask) >= window_size:
+                # Get valid values in this column
+                valid_indices = np.where(col_mask)[0]
+                v_col = self.v[valid_indices, ix]
+
+                # Apply median filter
+                v_filtered = median_filter(v_col, size=window_size, mode='reflect')
+
+                # Put back
+                v_smoothed[valid_indices, ix] = v_filtered
+
+        return DICResult(
+            u=self.u.copy(),
+            v=v_smoothed,
+            corrcoef=self.corrcoef.copy(),
+            roi=self.roi.copy(),
+            seed_info=self.seed_info,
+            converged=self.converged.copy() if self.converged is not None else None,
+            iterations=self.iterations.copy() if self.iterations is not None else None,
+        )
+
+    def smooth_displacement_field(self, sigma: float = 1.0) -> 'DICResult':
+        """
+        Apply Gaussian smoothing to both u and v displacement fields.
+
+        This can help reduce noise and banding artifacts while preserving
+        the overall displacement pattern.
+
+        Args:
+            sigma: Standard deviation of Gaussian filter (default 1.0)
+
+        Returns:
+            New DICResult with smoothed displacement fields
+        """
+        from scipy.ndimage import gaussian_filter
+
+        # Create copies
+        u_smoothed = self.u.copy()
+        v_smoothed = self.v.copy()
+
+        # Replace NaN with 0 for filtering, then restore
+        u_valid = np.where(self.roi, self.u, 0)
+        v_valid = np.where(self.roi, self.v, 0)
+
+        # Create weight mask for normalization
+        weight = self.roi.astype(np.float64)
+
+        # Apply Gaussian filter to values and weights
+        u_filtered = gaussian_filter(u_valid, sigma=sigma)
+        v_filtered = gaussian_filter(v_valid, sigma=sigma)
+        weight_filtered = gaussian_filter(weight, sigma=sigma)
+
+        # Normalize (avoid division by zero)
+        mask = weight_filtered > 0.1
+        u_smoothed = np.where(mask, u_filtered / weight_filtered, np.nan)
+        v_smoothed = np.where(mask, v_filtered / weight_filtered, np.nan)
+
+        # Restore original NaN positions
+        u_smoothed = np.where(self.roi, u_smoothed, np.nan)
+        v_smoothed = np.where(self.roi, v_smoothed, np.nan)
+
+        return DICResult(
+            u=u_smoothed,
+            v=v_smoothed,
+            corrcoef=self.corrcoef.copy(),
+            roi=self.roi.copy(),
+            seed_info=self.seed_info,
+            converged=self.converged.copy() if self.converged is not None else None,
+            iterations=self.iterations.copy() if self.iterations is not None else None,
+        )
+
+    def remove_rigid_body_motion(self, reference_point: Optional[Tuple[int, int]] = None) -> 'DICResult':
+        """
+        Remove rigid body motion (translation) from displacement fields.
+
+        This subtracts the mean displacement (or displacement at a reference point)
+        so that only relative displacements remain.
+
+        Args:
+            reference_point: Optional (x_grid, y_grid) tuple. If provided, subtract
+                           displacement at this point. If None, subtract mean displacement.
+
+        Returns:
+            New DICResult with rigid body motion removed
+        """
+        u_corrected = self.u.copy()
+        v_corrected = self.v.copy()
+
+        if reference_point is not None:
+            # Use displacement at reference point
+            x_ref, y_ref = reference_point
+            if self.roi[y_ref, x_ref]:
+                u_offset = self.u[y_ref, x_ref]
+                v_offset = self.v[y_ref, x_ref]
+            else:
+                # Reference point not valid, fall back to mean
+                u_offset = np.nanmean(self.u[self.roi])
+                v_offset = np.nanmean(self.v[self.roi])
+        else:
+            # Use mean displacement
+            u_offset = np.nanmean(self.u[self.roi])
+            v_offset = np.nanmean(self.v[self.roi])
+
+        u_corrected = u_corrected - u_offset
+        v_corrected = v_corrected - v_offset
+
+        # Keep NaN where originally NaN
+        u_corrected[~self.roi] = np.nan
+        v_corrected[~self.roi] = np.nan
+
+        return DICResult(
+            u=u_corrected,
+            v=v_corrected,
+            corrcoef=self.corrcoef.copy(),
+            roi=self.roi.copy(),
+            seed_info=self.seed_info,
+            converged=self.converged.copy() if self.converged is not None else None,
+            iterations=self.iterations.copy() if self.iterations is not None else None,
+        )
+
+    def remove_linear_trend(self, remove_u_trend: bool = True, remove_v_trend: bool = True) -> 'DICResult':
+        """
+        Remove linear trend (plane fit) from displacement fields.
+
+        This removes global bending/rotation effects by fitting and subtracting
+        a linear plane: u = a*x + b*y + c
+
+        After this, only local deviations from the linear trend remain,
+        which is useful for detecting cracks and local strain concentrations.
+
+        Args:
+            remove_u_trend: Remove linear trend from u field (default True)
+            remove_v_trend: Remove linear trend from v field (default True)
+
+        Returns:
+            New DICResult with linear trends removed
+        """
+        u_corrected = self.u.copy()
+        v_corrected = self.v.copy()
+
+        # Get valid points
+        valid_y, valid_x = np.where(self.roi)
+
+        if len(valid_x) < 10:
+            # Not enough points for fitting
+            return self
+
+        # Fit and remove trend from u
+        if remove_u_trend:
+            u_valid = self.u[self.roi]
+
+            # Build design matrix for plane fit: u = a*x + b*y + c
+            A = np.column_stack([valid_x, valid_y, np.ones_like(valid_x)])
+
+            # Least squares fit
+            coeffs_u, _, _, _ = np.linalg.lstsq(A, u_valid, rcond=None)
+            a_u, b_u, c_u = coeffs_u
+
+            # Subtract fitted plane
+            out_h, out_w = self.u.shape
+            yy, xx = np.meshgrid(np.arange(out_h), np.arange(out_w), indexing='ij')
+            u_trend = a_u * xx + b_u * yy + c_u
+            u_corrected = self.u - u_trend
+            u_corrected[~self.roi] = np.nan
+
+        # Fit and remove trend from v
+        if remove_v_trend:
+            v_valid = self.v[self.roi]
+
+            A = np.column_stack([valid_x, valid_y, np.ones_like(valid_x)])
+            coeffs_v, _, _, _ = np.linalg.lstsq(A, v_valid, rcond=None)
+            a_v, b_v, c_v = coeffs_v
+
+            out_h, out_w = self.v.shape
+            yy, xx = np.meshgrid(np.arange(out_h), np.arange(out_w), indexing='ij')
+            v_trend = a_v * xx + b_v * yy + c_v
+            v_corrected = self.v - v_trend
+            v_corrected[~self.roi] = np.nan
+
+        return DICResult(
+            u=u_corrected,
+            v=v_corrected,
+            corrcoef=self.corrcoef.copy(),
+            roi=self.roi.copy(),
+            seed_info=self.seed_info,
+            converged=self.converged.copy() if self.converged is not None else None,
+            iterations=self.iterations.copy() if self.iterations is not None else None,
+        )
+
+    def get_relative_displacement(self, remove_translation: bool = True,
+                                   remove_trend: bool = True) -> 'DICResult':
+        """
+        Get relative displacement field with rigid body motion and trends removed.
+
+        This is a convenience method that combines:
+        1. Remove rigid body translation (mean displacement)
+        2. Remove linear trend (bending/rotation)
+
+        The result shows only LOCAL deviations - useful for crack detection.
+
+        Args:
+            remove_translation: Remove mean displacement (default True)
+            remove_trend: Remove linear trend (default True)
+
+        Returns:
+            New DICResult with corrections applied
+        """
+        result = self
+
+        if remove_translation:
+            result = result.remove_rigid_body_motion()
+
+        if remove_trend:
+            result = result.remove_linear_trend()
+
+        return result
+
 
 # =============================================================================
 # Module-level Numba-accelerated functions for IC-GN optimization
@@ -142,7 +425,11 @@ class DICResult:
 
 @njit(cache=True, fastmath=True)
 def _bspline_interp(px: float, py: float, bcoef: NDArray[np.float64]) -> float:
-    """Inline B-spline interpolation for a single point (value only)."""
+    """Inline B-spline interpolation for a single point (value only).
+
+    Uses the CORRECT quintic B-spline basis functions that satisfy
+    the partition of unity property (sum of basis functions = 1).
+    """
     h, w = bcoef.shape
     if px < 2.0 or px >= w - 3.0 or py < 2.0 or py >= h - 3.0:
         return np.nan
@@ -158,36 +445,44 @@ def _bspline_interp(px: float, py: float, bcoef: NDArray[np.float64]) -> float:
         if t_y >= 3.0:
             by = 0.0
         elif t_y >= 2.0:
+            # (3-|t|)^5 / 120
             tmp = 3.0 - t_y
             by = tmp * tmp * tmp * tmp * tmp / 120.0
         elif t_y >= 1.0:
+            # (5|t|^5 - 45|t|^4 + 150|t|^3 - 210|t|^2 + 75|t| + 51) / 120
             t2 = t_y * t_y
             t3 = t2 * t_y
             t4 = t3 * t_y
             t5 = t4 * t_y
-            by = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_y + 1215.0) / 120.0
+            by = (5.0 * t5 - 45.0 * t4 + 150.0 * t3 - 210.0 * t2 + 75.0 * t_y + 51.0) / 120.0
         else:
+            # (66 - 60*t^2 + 30*t^4 - 10*|t|^5) / 120
             t2 = t_y * t_y
             t4 = t2 * t2
-            by = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
+            t5 = t4 * t_y
+            by = (66.0 - 60.0 * t2 + 30.0 * t4 - 10.0 * t5) / 120.0
 
         for ii in range(-2, 4):
             t_x = abs(fx - ii)
             if t_x >= 3.0:
                 bx = 0.0
             elif t_x >= 2.0:
+                # (3-|t|)^5 / 120
                 tmp = 3.0 - t_x
                 bx = tmp * tmp * tmp * tmp * tmp / 120.0
             elif t_x >= 1.0:
+                # (5|t|^5 - 45|t|^4 + 150|t|^3 - 210|t|^2 + 75|t| + 51) / 120
                 t2 = t_x * t_x
                 t3 = t2 * t_x
                 t4 = t3 * t_x
                 t5 = t4 * t_x
-                bx = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_x + 1215.0) / 120.0
+                bx = (5.0 * t5 - 45.0 * t4 + 150.0 * t3 - 210.0 * t2 + 75.0 * t_x + 51.0) / 120.0
             else:
+                # (66 - 60*t^2 + 30*t^4 - 10*|t|^5) / 120
                 t2 = t_x * t_x
                 t4 = t2 * t2
-                bx = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
+                t5 = t4 * t_x
+                bx = (66.0 - 60.0 * t2 + 30.0 * t4 - 10.0 * t5) / 120.0
 
             value += bcoef[iy + jj, ix + ii] * bx * by
 
@@ -198,7 +493,11 @@ def _bspline_interp(px: float, py: float, bcoef: NDArray[np.float64]) -> float:
 def _bspline_interp_with_grad(
     px: float, py: float, bcoef: NDArray[np.float64]
 ) -> Tuple[float, float, float]:
-    """Inline B-spline interpolation with gradients."""
+    """Inline B-spline interpolation with gradients.
+
+    Uses the CORRECT quintic B-spline basis functions and derivatives
+    that satisfy the partition of unity property.
+    """
     h, w = bcoef.shape
     if px < 2.0 or px >= w - 3.0 or py < 2.0 or py >= h - 3.0:
         return np.nan, np.nan, np.nan
@@ -218,22 +517,29 @@ def _bspline_interp_with_grad(
             by = 0.0
             dby = 0.0
         elif t_y >= 2.0:
+            # B(t) = (3-|t|)^5 / 120
+            # B'(t) = -sign(t) * (3-|t|)^4 / 24
             tmp = 3.0 - t_y
             by = tmp * tmp * tmp * tmp * tmp / 120.0
             dby = -tmp * tmp * tmp * tmp / 24.0
         elif t_y >= 1.0:
+            # B(t) = (5|t|^5 - 45|t|^4 + 150|t|^3 - 210|t|^2 + 75|t| + 51) / 120
+            # B'(t) = sign(t) * (25|t|^4 - 180|t|^3 + 450|t|^2 - 420|t| + 75) / 120
             t2 = t_y * t_y
             t3 = t2 * t_y
             t4 = t3 * t_y
             t5 = t4 * t_y
-            by = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_y + 1215.0) / 120.0
-            dby = (-25.0 * t4 + 300.0 * t3 - 1350.0 * t2 + 2700.0 * t_y - 2025.0) / 120.0
+            by = (5.0 * t5 - 45.0 * t4 + 150.0 * t3 - 210.0 * t2 + 75.0 * t_y + 51.0) / 120.0
+            dby = (25.0 * t4 - 180.0 * t3 + 450.0 * t2 - 420.0 * t_y + 75.0) / 120.0
         else:
+            # B(t) = (66 - 60*t^2 + 30*t^4 - 10*|t|^5) / 120
+            # B'(t) = (-120*|t| + 120*|t|^3 - 50*|t|^4) / 120 (before sign adjustment)
             t2 = t_y * t_y
-            t4 = t2 * t2
-            by = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
             t3 = t2 * t_y
-            dby = (-60.0 * t_y + 20.0 * t3) / 60.0
+            t4 = t2 * t2
+            t5 = t4 * t_y
+            by = (66.0 - 60.0 * t2 + 30.0 * t4 - 10.0 * t5) / 120.0
+            dby = (-120.0 * t_y + 120.0 * t3 - 50.0 * t4) / 120.0
 
         if (fy - jj) < 0:
             dby = -dby
@@ -244,22 +550,29 @@ def _bspline_interp_with_grad(
                 bx = 0.0
                 dbx = 0.0
             elif t_x >= 2.0:
+                # B(t) = (3-|t|)^5 / 120
+                # B'(t) = -sign(t) * (3-|t|)^4 / 24
                 tmp = 3.0 - t_x
                 bx = tmp * tmp * tmp * tmp * tmp / 120.0
                 dbx = -tmp * tmp * tmp * tmp / 24.0
             elif t_x >= 1.0:
+                # B(t) = (5|t|^5 - 45|t|^4 + 150|t|^3 - 210|t|^2 + 75|t| + 51) / 120
+                # B'(t) = sign(t) * (25|t|^4 - 180|t|^3 + 450|t|^2 - 420|t| + 75) / 120
                 t2 = t_x * t_x
                 t3 = t2 * t_x
                 t4 = t3 * t_x
                 t5 = t4 * t_x
-                bx = (-5.0 * t5 + 75.0 * t4 - 450.0 * t3 + 1350.0 * t2 - 2025.0 * t_x + 1215.0) / 120.0
-                dbx = (-25.0 * t4 + 300.0 * t3 - 1350.0 * t2 + 2700.0 * t_x - 2025.0) / 120.0
+                bx = (5.0 * t5 - 45.0 * t4 + 150.0 * t3 - 210.0 * t2 + 75.0 * t_x + 51.0) / 120.0
+                dbx = (25.0 * t4 - 180.0 * t3 + 450.0 * t2 - 420.0 * t_x + 75.0) / 120.0
             else:
+                # B(t) = (66 - 60*t^2 + 30*t^4 - 10*|t|^5) / 120
+                # B'(t) = (-120*|t| + 120*|t|^3 - 50*|t|^4) / 120 (before sign adjustment)
                 t2 = t_x * t_x
-                t4 = t2 * t2
-                bx = (33.0 - 30.0 * t2 + 5.0 * t4) / 60.0 - t2 * (1.0 - t2) / 12.0
                 t3 = t2 * t_x
-                dbx = (-60.0 * t_x + 20.0 * t3) / 60.0
+                t4 = t2 * t2
+                t5 = t4 * t_x
+                bx = (66.0 - 60.0 * t2 + 30.0 * t4 - 10.0 * t5) / 120.0
+                dbx = (-120.0 * t_x + 120.0 * t3 - 50.0 * t4) / 120.0
 
             if (fx - ii) < 0:
                 dbx = -dbx
@@ -1238,6 +1551,98 @@ def _process_points_parallel(
     return u_out, v_out, dudx_out, dudy_out, dvdx_out, dvdy_out, cc_out, conv_out, iter_out
 
 
+@njit(cache=True, parallel=True)
+def _process_batch_with_ncc_search(
+    ref_bcoef: NDArray[np.float64],
+    cur_bcoef: NDArray[np.float64],
+    border: int,
+    points_x: NDArray[np.int32],
+    points_y: NDArray[np.int32],
+    u_init: NDArray[np.float64],
+    v_init: NDArray[np.float64],
+    dudx_init: NDArray[np.float64],
+    dudy_init: NDArray[np.float64],
+    dvdx_init: NDArray[np.float64],
+    dvdy_init: NDArray[np.float64],
+    radius: int,
+    cutoff_diffnorm: float,
+    cutoff_iteration: int,
+    ncc_search_radius: int = 2,
+) -> Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64],
+           NDArray[np.float64], NDArray[np.float64], NDArray[np.float64],
+           NDArray[np.float64], NDArray[np.bool_], NDArray[np.int32]]:
+    """
+    Process a batch of points in parallel: NCC search + IC-GN.
+
+    For each point:
+    1. Refine initial guess with local NCC search
+    2. Run IC-GN optimization with affine warp
+
+    Args:
+        ref_bcoef, cur_bcoef: B-spline coefficients
+        border: Border size
+        points_x, points_y: Point coordinates
+        u_init, v_init: Initial displacement guesses
+        dudx_init, dudy_init, dvdx_init, dvdy_init: Initial strain guesses
+        radius: Subset radius
+        cutoff_diffnorm, cutoff_iteration: IC-GN convergence parameters
+        ncc_search_radius: Local NCC search radius (default 2)
+
+    Returns:
+        Tuple of (u, v, dudx, dudy, dvdx, dvdy, corrcoef, converged, iterations)
+    """
+    n_points = len(points_x)
+
+    u_out = np.empty(n_points, dtype=np.float64)
+    v_out = np.empty(n_points, dtype=np.float64)
+    dudx_out = np.empty(n_points, dtype=np.float64)
+    dudy_out = np.empty(n_points, dtype=np.float64)
+    dvdx_out = np.empty(n_points, dtype=np.float64)
+    dvdy_out = np.empty(n_points, dtype=np.float64)
+    cc_out = np.empty(n_points, dtype=np.float64)
+    conv_out = np.empty(n_points, dtype=np.bool_)
+    iter_out = np.empty(n_points, dtype=np.int32)
+
+    for idx in prange(n_points):
+        # Step 1: Refine initial guess with NCC search
+        u_ncc, v_ncc, ncc_val = _local_ncc_search(
+            ref_bcoef, cur_bcoef, border,
+            points_x[idx], points_y[idx], radius,
+            u_init[idx], v_init[idx],
+            ncc_search_radius,
+        )
+
+        # Use refined guess if NCC search succeeded
+        if ncc_val > 0.5:
+            u_start = u_ncc
+            v_start = v_ncc
+        else:
+            u_start = u_init[idx]
+            v_start = v_init[idx]
+
+        # Step 2: Run IC-GN with affine warp
+        u, v, dudx, dudy, dvdx, dvdy, cc, conv, n_iter = _ic_gn_affine(
+            ref_bcoef, cur_bcoef, border,
+            points_x[idx], points_y[idx], radius,
+            u_start, v_start,
+            dudx_init[idx], dudy_init[idx],
+            dvdx_init[idx], dvdy_init[idx],
+            cutoff_diffnorm, cutoff_iteration,
+        )
+
+        u_out[idx] = u
+        v_out[idx] = v
+        dudx_out[idx] = dudx
+        dudy_out[idx] = dudy
+        dvdx_out[idx] = dvdx
+        dvdy_out[idx] = dvdy
+        cc_out[idx] = cc
+        conv_out[idx] = conv
+        iter_out[idx] = n_iter
+
+    return u_out, v_out, dudx_out, dudy_out, dvdx_out, dvdy_out, cc_out, conv_out, iter_out
+
+
 # =============================================================================
 # Main DICAnalysis class
 # =============================================================================
@@ -1270,6 +1675,44 @@ class DICAnalysis:
         if self._progress_callback:
             self._progress_callback(progress, message)
 
+    def _save_debug_output(self, result: DICResult, image_index: int) -> None:
+        """
+        Save intermediate results for debugging.
+
+        When params.debug is True, saves displacement fields, correlation
+        coefficients, and other diagnostic data to the debug output directory.
+
+        Args:
+            result: DIC result to save
+            image_index: Index of the current image in sequence
+        """
+        if not self.params.debug:
+            return
+
+        # Create output directory
+        output_dir = Path(self.params.debug_output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate filename with timestamp
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"dic_result_{image_index:03d}_{timestamp}.npz"
+        filepath = output_dir / filename
+
+        # Save all result fields
+        np.savez_compressed(
+            filepath,
+            u=result.u,
+            v=result.v,
+            corrcoef=result.corrcoef,
+            roi=result.roi,
+            converged=result.converged,
+            iterations=result.iterations,
+            params=self.params.to_dict(),
+            image_index=image_index,
+        )
+
+        print(f"Debug output saved to: {filepath}")
+
     def analyze(
         self,
         ref_img: NcorrImage,
@@ -1298,6 +1741,9 @@ class DICAnalysis:
 
             result = self._analyze_single(ref_img, cur_img, roi, current_seeds, prev_result)
             results.append(result)
+
+            # Save debug output if enabled
+            self._save_debug_output(result, i)
 
             # Use this result as initial guess for next image
             prev_result = result
@@ -1427,241 +1873,202 @@ class DICAnalysis:
         prev_roi: Optional[NDArray[np.bool_]] = None,
     ) -> int:
         """
-        Process a single region using flood-fill from seed.
+        Process a single region using parallel wavefront propagation.
 
-        Uses 6-parameter affine model with local NCC search for robust convergence.
-        If prev_u/prev_v are provided (from previous frame), uses them as initial guesses.
+        Parallel batch approach:
+        1. Process seed point first
+        2. Collect all frontier points (unprocessed neighbors of processed points)
+        3. Process entire frontier in parallel using Numba prange
+        4. Filter results and add valid points
+        5. Repeat until no more frontier points
+        6. Display progress with tqdm
         """
         radius = self.params.radius
         cutoff_diffnorm = self.params.cutoff_diffnorm
         cutoff_iteration = self.params.cutoff_iteration
 
-        # Check if we have previous results to use as initial guesses
-        use_prev_result = (prev_u is not None and prev_v is not None and prev_roi is not None)
-
-        # DEBUG: Print seed and parameters
-        print(f"\n{'='*60}")
-        print(f"DEBUG _process_region_optimized:")
-        print(f"  Seed position: ({seed.x}, {seed.y})")
-        print(f"  Seed displacement: u={seed.u:.4f}, v={seed.v:.4f}")
-        print(f"  Radius: {radius}, Step: {step}")
-        print(f"  Border: {border}")
-        print(f"  Using previous result: {use_prev_result}")
-        print(f"  cutoff_diffnorm: {cutoff_diffnorm}, cutoff_iteration: {cutoff_iteration}")
-
-        # DEBUG: Test IC-GN directly at seed point
-        print(f"\nDEBUG: Testing IC-GN directly at seed point...")
-        test_u, test_v, test_cc, test_conv, test_iter = _ic_gn_translation(
-            ref_bcoef, cur_bcoef, border,
-            seed.x, seed.y, radius,
-            seed.u, seed.v,
-            cutoff_diffnorm, cutoff_iteration,
-        )
-        print(f"  Direct IC-GN result: u={test_u:.4f}, v={test_v:.4f}, CC={test_cc:.4f}, conv={test_conv}, iter={test_iter}")
-
-        # DEBUG: Also test with zero initial guess
-        print(f"\nDEBUG: Testing IC-GN with zero initial guess...")
-        test_u0, test_v0, test_cc0, test_conv0, test_iter0 = _ic_gn_translation(
-            ref_bcoef, cur_bcoef, border,
-            seed.x, seed.y, radius,
-            0.0, 0.0,
-            cutoff_diffnorm, cutoff_iteration,
-        )
-        print(f"  Zero-init IC-GN result: u={test_u0:.4f}, v={test_v0:.4f}, CC={test_cc0:.4f}, conv={test_conv0}, iter={test_iter0}")
-        print(f"{'='*60}")
-
-        # Minimum correlation to propagate result as initial guess
-        min_cc_for_propagation = 0.9
+        # MATLAB cutoffs
+        cutoff_disp = float(step)  # Displacement jump cutoff (spacing+1 in MATLAB)
 
         # Get region data for in-region checking
         leftbound = region.leftbound
         noderange = np.asarray(region.noderange, dtype=np.int32)
         nodelist = np.asarray(region.nodelist, dtype=np.int32)
 
-        # First, collect all points in region
+        # Debug counters for rejection reasons
+        reject_outside_roi = 0
+        reject_nan_cc = 0
+        reject_low_cc = 0
+        reject_disp_jump = 0
+
         out_h, out_w = u_plot.shape
 
-        # Queue for flood-fill processing
-        # Format: (x, y, u_guess, v_guess)
-        queue = deque([(seed.x, seed.y, seed.u, seed.v)])
-        processed = set()
-        points_processed = 0
+        # Store strain fields for propagation
+        dudx_field = np.zeros((out_h, out_w), dtype=np.float64)
+        dudy_field = np.zeros((out_h, out_w), dtype=np.float64)
+        dvdx_field = np.zeros((out_h, out_w), dtype=np.float64)
+        dvdy_field = np.zeros((out_h, out_w), dtype=np.float64)
 
-        # Estimate total points if not provided
+        # Initialize seed using AFFINE model
+        seed_u, seed_v, seed_dudx, seed_dudy, seed_dvdx, seed_dvdy, seed_cc, seed_conv, seed_iter = _ic_gn_affine(
+            ref_bcoef, cur_bcoef, border,
+            seed.x, seed.y, radius,
+            seed.u, seed.v,
+            0.0, 0.0, 0.0, 0.0,  # Initial strain guess = 0
+            cutoff_diffnorm, cutoff_iteration,
+        )
+
+        if np.isnan(seed_cc) or seed_cc < 0.5:
+            print(f"WARNING: Seed failed! CC={seed_cc}")
+            return 0
+
+        # Track calculated points
+        calc_points = np.zeros((out_h, out_w), dtype=np.bool_)
+        ox_seed, oy_seed = seed.x // step, seed.y // step
+        calc_points[oy_seed, ox_seed] = True
+
+        # Store seed result
+        u_plot[oy_seed, ox_seed] = seed_u
+        v_plot[oy_seed, ox_seed] = seed_v
+        corrcoef_plot[oy_seed, ox_seed] = seed_cc
+        roi_plot[oy_seed, ox_seed] = True
+        converged[oy_seed, ox_seed] = True
+        dudx_field[oy_seed, ox_seed] = seed_dudx
+        dudy_field[oy_seed, ox_seed] = seed_dudy
+        dvdx_field[oy_seed, ox_seed] = seed_dvdx
+        dvdy_field[oy_seed, ox_seed] = seed_dvdy
+
+        points_processed = 1
+
         if estimated_points <= 0:
             estimated_points = region.totalpoints // (step * step) if region.totalpoints > 0 else 10000
 
-        # Progress reporting at 1% increments
-        last_progress_percent = -1
+        # Queue of points to propagate from: (x, y, u, v, dudx, dudy, dvdx, dvdy)
+        active_points = [(seed.x, seed.y, seed_u, seed_v, seed_dudx, seed_dudy, seed_dvdx, seed_dvdy)]
 
-        # Batch processing parameters - smaller batches for better neighbor consistency
-        batch_size = 100
-        batch_points_x = []
-        batch_points_y = []
-        batch_u_init = []
-        batch_v_init = []
-        batch_ox = []
-        batch_oy = []
+        # Progress bar for displacement calculation
+        pbar = tqdm(total=estimated_points, desc="Displacement", unit="pts",
+                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+        pbar.update(1)  # Seed point
 
-        debug_batch_count = [0]  # Use list to allow modification in nested function
+        while active_points:
+            # Collect all frontier points from active points
+            frontier = []  # List of (nx, ny, u_init, v_init, dudx_init, dudy_init, dvdx_init, dvdy_init, parent_idx)
 
-        def process_batch():
-            """Process accumulated batch of points in parallel using translation model."""
-            nonlocal points_processed, last_progress_percent
+            for parent_idx, (x, y, u, v, dudx, dudy, dvdx, dvdy) in enumerate(active_points):
+                # Check neighbors - MATLAB order: top, right, bottom, left
+                for dx_step, dy_step in [(0, -step), (step, 0), (0, step), (-step, 0)]:
+                    nx, ny = x + dx_step, y + dy_step
+                    nx_out, ny_out = nx // step, ny // step
 
-            if not batch_points_x:
-                return
+                    if not (0 <= ny_out < out_h and 0 <= nx_out < out_w):
+                        continue
 
-            # Convert to arrays
-            px = np.array(batch_points_x, dtype=np.int32)
-            py = np.array(batch_points_y, dtype=np.int32)
-            ui = np.array(batch_u_init, dtype=np.float64)
-            vi = np.array(batch_v_init, dtype=np.float64)
+                    if calc_points[ny_out, nx_out]:
+                        continue
 
-            # DEBUG: Print first batch info
-            if debug_batch_count[0] == 0:
-                print(f"\nDEBUG First batch (Translation model, batch_size={batch_size}):")
-                print(f"  Number of points: {len(px)}")
-                for i in range(min(5, len(px))):
-                    print(f"  Point {i}: ({px[i]}, {py[i]}) init u={ui[i]:.4f}, v={vi[i]:.4f}")
+                    # Mark as being processed (to avoid duplicates in frontier)
+                    calc_points[ny_out, nx_out] = True
 
-            # Process in parallel with TRANSLATION model (more stable)
-            u_res, v_res, cc_res, conv_res, iter_res = _process_points_parallel_translation(
-                ref_bcoef, cur_bcoef, border,
-                px, py, ui, vi,
-                radius, cutoff_diffnorm, cutoff_iteration,
-            )
+                    if not _check_point_in_region(nx, ny, leftbound, noderange, nodelist):
+                        reject_outside_roi += 1
+                        continue
 
-            # DEBUG: Print first batch results
-            if debug_batch_count[0] == 0:
-                print(f"\nDEBUG First batch RESULTS (Translation model):")
-                for i in range(min(5, len(px))):
-                    print(f"  Point {i}: u={u_res[i]:.4f}, v={v_res[i]:.4f}, CC={cc_res[i]:.4f}, conv={conv_res[i]}, iter={iter_res[i]}")
-                debug_batch_count[0] += 1
+                    # Initial guess: propagate displacement using strain
+                    u_init = u + dudx * dx_step + dudy * dy_step
+                    v_init = v + dvdx * dx_step + dvdy * dy_step
 
-            # Store results and check consistency
-            for idx in range(len(batch_points_x)):
-                ox = batch_ox[idx]
-                oy = batch_oy[idx]
-                x = batch_points_x[idx]
-                y = batch_points_y[idx]
+                    frontier.append((nx, ny, u_init, v_init, dudx, dudy, dvdx, dvdy))
 
-                if np.isnan(u_res[idx]):
-                    continue
+            if not frontier:
+                break
 
-                u_result = u_res[idx]
-                v_result = v_res[idx]
-                cc_result = cc_res[idx]
+            # Convert frontier to arrays for parallel processing
+            n_frontier = len(frontier)
+            points_x = np.array([f[0] for f in frontier], dtype=np.int32)
+            points_y = np.array([f[1] for f in frontier], dtype=np.int32)
+            u_init_arr = np.array([f[2] for f in frontier], dtype=np.float64)
+            v_init_arr = np.array([f[3] for f in frontier], dtype=np.float64)
+            dudx_init_arr = np.array([f[4] for f in frontier], dtype=np.float64)
+            dudy_init_arr = np.array([f[5] for f in frontier], dtype=np.float64)
+            dvdx_init_arr = np.array([f[6] for f in frontier], dtype=np.float64)
+            dvdy_init_arr = np.array([f[7] for f in frontier], dtype=np.float64)
 
-                # Consistency check: compare with already-processed neighbors
-                # If displacement differs too much, re-try with neighbor's value
-                neighbor_offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-                for nox, noy in neighbor_offsets:
-                    nx_out, ny_out = ox + nox, oy + noy
-                    if 0 <= ny_out < out_h and 0 <= nx_out < out_w:
-                        if roi_plot[ny_out, nx_out] and not np.isnan(u_plot[ny_out, nx_out]):
-                            neighbor_u = u_plot[ny_out, nx_out]
-                            neighbor_v = v_plot[ny_out, nx_out]
-
-                            # Check if there's a significant jump (> 0.5 pixel)
-                            du = abs(u_result - neighbor_u)
-                            dv = abs(v_result - neighbor_v)
-
-                            if du > 0.5 or dv > 0.5:
-                                # Re-try IC-GN with neighbor's displacement as initial guess
-                                u_retry, v_retry, cc_retry, _, _ = _ic_gn_translation(
-                                    ref_bcoef, cur_bcoef, border,
-                                    x, y, radius,
-                                    neighbor_u, neighbor_v,
-                                    cutoff_diffnorm, cutoff_iteration,
-                                )
-
-                                # Keep the result with higher correlation
-                                if cc_retry > cc_result:
-                                    u_result = u_retry
-                                    v_result = v_retry
-                                    cc_result = cc_retry
-                                    # Only need one successful retry
-                                    break
-
-                # Store the (possibly corrected) result
-                u_plot[oy, ox] = u_result
-                v_plot[oy, ox] = v_result
-                corrcoef_plot[oy, ox] = cc_result
-                roi_plot[oy, ox] = True
-                converged[oy, ox] = conv_res[idx]
-                iterations[oy, ox] = iter_res[idx]
-                points_processed += 1
-
-                # Add neighbors to queue
-                if cc_result >= min_cc_for_propagation:
-                    for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
-                        nx, ny = x + dx, y + dy
-                        if (nx, ny) not in processed:
-                            queue.append((nx, ny, u_result, v_result))
-                else:
-                    for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step)]:
-                        nx, ny = x + dx, y + dy
-                        if (nx, ny) not in processed:
-                            queue.append((nx, ny, seed.u, seed.v))
-
-            # Clear batch
-            batch_points_x.clear()
-            batch_points_y.clear()
-            batch_u_init.clear()
-            batch_v_init.clear()
-            batch_ox.clear()
-            batch_oy.clear()
-
-            # Progress reporting
-            current_percent = int(points_processed * 100 / max(1, estimated_points))
-            if current_percent > last_progress_percent and self._progress_callback:
-                last_progress_percent = current_percent
-                progress = min(0.99, points_processed / max(1, estimated_points))
-                self._report_progress(
-                    progress,
-                    f"Processing... {points_processed:,}/{estimated_points:,} points ({current_percent}%)"
+            # Process frontier in parallel (NCC search + IC-GN)
+            u_out, v_out, dudx_out, dudy_out, dvdx_out, dvdy_out, cc_out, conv_out, iter_out = \
+                _process_batch_with_ncc_search(
+                    ref_bcoef, cur_bcoef, border,
+                    points_x, points_y,
+                    u_init_arr, v_init_arr,
+                    dudx_init_arr, dudy_init_arr, dvdx_init_arr, dvdy_init_arr,
+                    radius, cutoff_diffnorm, cutoff_iteration,
+                    ncc_search_radius=2,
                 )
 
-        while queue or batch_points_x:
-            # Fill batch from queue
-            while queue and len(batch_points_x) < batch_size:
-                x, y, u_guess, v_guess = queue.popleft()
+            # Process results and collect new active points
+            new_active = []
+            for i in range(n_frontier):
+                nx, ny = points_x[i], points_y[i]
+                nx_out, ny_out = nx // step, ny // step
+                new_u, new_v = u_out[i], v_out[i]
+                new_cc = cc_out[i]
+                u_init = u_init_arr[i]
+                v_init = v_init_arr[i]
 
-                # Convert to output coordinates
-                ox, oy = x // step, y // step
-
-                if (x, y) in processed:
+                if np.isnan(new_cc):
+                    reject_nan_cc += 1
                     continue
 
-                if not (0 <= oy < out_h and 0 <= ox < out_w):
+                if new_cc < 0.0:
+                    reject_low_cc += 1
                     continue
 
-                processed.add((x, y))
-
-                # Check if point is in region
-                if not _check_point_in_region(x, y, leftbound, noderange, nodelist):
+                # Displacement jump cutoff
+                if abs(u_init - new_u) >= cutoff_disp or abs(v_init - new_v) >= cutoff_disp:
+                    reject_disp_jump += 1
                     continue
 
-                # Use previous result as initial guess if available
-                if use_prev_result and prev_roi[oy, ox] and not np.isnan(prev_u[oy, ox]):
-                    u_init_val = prev_u[oy, ox]
-                    v_init_val = prev_v[oy, ox]
-                else:
-                    u_init_val = u_guess
-                    v_init_val = v_guess
+                # Accept this point
+                u_plot[ny_out, nx_out] = new_u
+                v_plot[ny_out, nx_out] = new_v
+                corrcoef_plot[ny_out, nx_out] = new_cc
+                roi_plot[ny_out, nx_out] = True
+                converged[ny_out, nx_out] = conv_out[i]
+                iterations[ny_out, nx_out] = iter_out[i]
 
-                # Add to batch
-                batch_points_x.append(x)
-                batch_points_y.append(y)
-                batch_u_init.append(u_init_val)
-                batch_v_init.append(v_init_val)
-                batch_ox.append(ox)
-                batch_oy.append(oy)
+                dudx_field[ny_out, nx_out] = dudx_out[i]
+                dudy_field[ny_out, nx_out] = dudy_out[i]
+                dvdx_field[ny_out, nx_out] = dvdx_out[i]
+                dvdy_field[ny_out, nx_out] = dvdy_out[i]
 
-            # Process batch if full or queue is empty
-            if len(batch_points_x) >= batch_size or (not queue and batch_points_x):
-                process_batch()
+                points_processed += 1
+                new_active.append((nx, ny, new_u, new_v, dudx_out[i], dudy_out[i], dvdx_out[i], dvdy_out[i]))
+
+            # Update progress bar
+            pbar.update(len(new_active))
+
+            # Sort new_active by correlation (highest first) for better propagation order
+            # This maintains some of the priority queue behavior
+            active_points = sorted(new_active, key=lambda p: -corrcoef_plot[p[1] // step, p[0] // step])
+
+        pbar.close()
+
+        # Print summary
+        print(f"\nDisplacement calculation complete:")
+        print(f"  Points processed: {points_processed:,}")
+        print(f"  Rejections: ROI={reject_outside_roi}, NaN={reject_nan_cc}, "
+              f"LowCC={reject_low_cc}, Jump={reject_disp_jump}")
+
+        # Print displacement statistics
+        if points_processed > 0:
+            valid_mask = roi_plot
+            if np.any(valid_mask):
+                u_valid = u_plot[valid_mask]
+                v_valid = v_plot[valid_mask]
+                cc_valid = corrcoef_plot[valid_mask]
+                print(f"  u: [{np.min(u_valid):.3f}, {np.max(u_valid):.3f}], mean={np.mean(u_valid):.3f}")
+                print(f"  v: [{np.min(v_valid):.3f}, {np.max(v_valid):.3f}], mean={np.mean(v_valid):.3f}")
+                print(f"  CC: [{np.min(cc_valid):.4f}, {np.max(cc_valid):.4f}], mean={np.mean(cc_valid):.4f}")
 
         return points_processed
 
