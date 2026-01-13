@@ -196,22 +196,19 @@ def create_displacement_curves(
     results: List[CrackAnalysisResult],
     config: dict,
     output_path: Path,
-    x_position_mm: Optional[float] = None,
-    x_position_idx: Optional[int] = None,
     dpi: int = 150,
     use_physical_coords: bool = True,
 ):
     """
-    Create plot of relative displacement vs y-coordinate for all images.
+    Create plot of maximum relative displacement vs x-coordinate for all images.
 
     Each curve represents one image, with colors from viridis colormap.
+    Shows the maximum relative y-displacement at each x-position (crack opening).
 
     Args:
         results: List of analysis results
         config: Analysis configuration
         output_path: Path for output figure
-        x_position_mm: x-position to extract curve (in mm, uses center if None)
-        x_position_idx: x-position index to extract curve (alternative to mm)
         dpi: Resolution
         use_physical_coords: Use mm coordinates instead of pixels
     """
@@ -219,41 +216,26 @@ def create_displacement_curves(
         print("No results to visualize")
         return
 
-    # Determine x position to use
-    r0 = results[0]
-    nx = len(r0.grid_x)
-
-    if x_position_idx is not None:
-        x_idx = x_position_idx
-    elif x_position_mm is not None:
-        # Find closest x position
-        x_idx = np.argmin(np.abs(r0.grid_x_mm - x_position_mm))
-    else:
-        # Use center
-        x_idx = nx // 2
-
-    x_value = r0.grid_x_mm[x_idx] if use_physical_coords else r0.grid_x[x_idx]
-
     # Set up figure
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(12, 8))
 
     # Color map for curves
     n_curves = len(results)
     colors = plt.cm.viridis(np.linspace(0, 1, n_curves))
 
-    # Plot each curve
+    # Plot each curve - max relative displacement vs x
     for i, r in enumerate(results):
         if use_physical_coords:
-            y_coords = r.grid_y_mm
+            x_coords = r.grid_x_mm
         else:
-            y_coords = r.grid_y
+            x_coords = r.grid_x
 
-        # Extract column at x position
-        rel_v_col = r.relative_v[:, x_idx]
+        # Use the pre-computed max relative displacement per x-position
+        max_rel_v = r.max_relative_v_per_x
 
         # Plot with color from viridis
         ax.plot(
-            y_coords, rel_v_col,
+            x_coords, max_rel_v,
             color=colors[i],
             alpha=0.7,
             linewidth=0.8,
@@ -264,9 +246,9 @@ def create_displacement_curves(
     ref_distance = config.get('reference_distance_mm', 1.0)
     coord_unit = "mm" if use_physical_coords else "px"
 
-    ax.set_xlabel(f"y [{coord_unit}]")
-    ax.set_ylabel(f"Relative y-displacement [px]")
-    ax.set_title(f"Relative v (over {ref_distance:.1f} mm) at x = {x_value:.1f} {coord_unit}")
+    ax.set_xlabel(f"x [{coord_unit}]")
+    ax.set_ylabel(f"Max. relative y-displacement [px]")
+    ax.set_title(f"Maximum relative y-displacement (over {ref_distance:.1f} mm) vs x-position")
 
     # Colorbar for image progression
     sm = plt.cm.ScalarMappable(
@@ -450,12 +432,6 @@ def main():
         help="Resolution for plots (default: 150)"
     )
     parser.add_argument(
-        "--x-position",
-        type=float,
-        default=None,
-        help="x-position in mm for displacement curves (default: center)"
-    )
-    parser.add_argument(
         "--crack-threshold",
         type=float,
         default=0.5,
@@ -495,11 +471,10 @@ def main():
     # Generate plots
     print("\nGenerating plots...")
 
-    # 1. Displacement curves
+    # 1. Displacement curves (max relative displacement vs x)
     create_displacement_curves(
         results, config,
         output_dir / "displacement_curves.png",
-        x_position_mm=args.x_position,
         dpi=args.dpi,
         use_physical_coords=use_physical,
     )
