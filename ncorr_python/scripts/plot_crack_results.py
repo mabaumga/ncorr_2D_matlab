@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -27,6 +28,11 @@ from tqdm import tqdm
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from batch_crack_analysis import CrackAnalysisResult, AnalysisConfig
+
+
+def is_ffmpeg_available() -> bool:
+    """Check if FFmpeg is available in PATH."""
+    return shutil.which('ffmpeg') is not None
 
 
 def load_results(results_dir: Path) -> Tuple[List[CrackAnalysisResult], dict]:
@@ -165,25 +171,23 @@ def create_heatmap_video(
 
     # Save video
     output_path = Path(output_path)
+
+    # Check if FFmpeg is available for MP4 output
+    use_ffmpeg = output_path.suffix.lower() != '.gif' and is_ffmpeg_available()
+
+    if output_path.suffix.lower() != '.gif' and not is_ffmpeg_available():
+        print("FFmpeg not found in PATH. Falling back to GIF format.")
+        print("To enable MP4: Install FFmpeg and add it to your PATH, then restart terminal.")
+        output_path = output_path.with_suffix('.gif')
+
     print(f"Saving video to {output_path}...")
 
-    # Try to save as MP4 first, fall back to GIF if FFmpeg not available
-    saved = False
-
-    if output_path.suffix.lower() != '.gif':
-        try:
-            writer = FFMpegWriter(fps=fps, metadata={'title': 'Crack Analysis'})
-            anim.save(output_path, writer=writer, dpi=dpi)
-            saved = True
-        except (FileNotFoundError, OSError) as e:
-            print(f"FFmpeg not available ({e}), falling back to GIF...")
-            output_path = output_path.with_suffix('.gif')
-
-    if not saved:
-        # Use GIF format
+    if use_ffmpeg:
+        writer = FFMpegWriter(fps=fps, metadata={'title': 'Crack Analysis'})
+    else:
         writer = PillowWriter(fps=fps)
-        anim.save(output_path, writer=writer, dpi=dpi)
 
+    anim.save(output_path, writer=writer, dpi=dpi)
     plt.close(fig)
     print(f"Video saved: {output_path}")
 
