@@ -94,6 +94,7 @@ class CrackAnalysisResult:
 
     image_name: str
     image_index: int
+    reference_image: str  # Name of reference image used
 
     # Grid coordinates (in pixels)
     grid_x: NDArray[np.float64]  # 1D array of x positions
@@ -128,6 +129,7 @@ class CrackAnalysisResult:
             filepath,
             image_name=self.image_name,
             image_index=self.image_index,
+            reference_image=self.reference_image,
             grid_x=self.grid_x,
             grid_y=self.grid_y,
             displacement_u=self.displacement_u,
@@ -150,6 +152,7 @@ class CrackAnalysisResult:
         return cls(
             image_name=str(data['image_name']),
             image_index=int(data['image_index']),
+            reference_image=str(data['reference_image']) if 'reference_image' in data else 'unknown',
             grid_x=data['grid_x'],
             grid_y=data['grid_y'],
             displacement_u=data['displacement_u'],
@@ -399,6 +402,7 @@ class BatchCrackAnalyzer:
         return CrackAnalysisResult(
             image_name=image_path.name,
             image_index=image_index,
+            reference_image=getattr(self, '_reference_name', 'unknown'),
             grid_x=grid_x,
             grid_y=grid_y,
             displacement_u=displacement_u,
@@ -446,9 +450,11 @@ class BatchCrackAnalyzer:
         reference_image = image_files[0]
         current_images = image_files[1:]
 
-        print(f"Reference image: {reference_image.name}")
-        print(f"Images to process: {len(current_images)}")
+        print(f"Reference image (FIXED): {reference_image.name}")
+        print(f"Images to process: {len(current_images)} (from {current_images[0].name} to {current_images[-1].name})")
         print(f"Output directory: {output_dir}")
+        print(f"Processing order: {'reverse (last→first)' if self.config.process_reverse else 'forward (first→last)'}")
+        print(f"NOTE: All images are compared against the reference: {reference_image.name}")
 
         # Save configuration
         config_path = output_dir / "analysis_config.json"
@@ -460,9 +466,10 @@ class BatchCrackAnalyzer:
         with open(config_path, 'w') as f:
             json.dump(config_data, f, indent=2)
 
-        # Initialize with reference
-        print("Setting up reference image...")
+        # Initialize with reference (this stays fixed for ALL images)
+        print(f"\nSetting up reference image: {reference_image.name}")
         self._setup_reference(reference_image)
+        self._reference_name = reference_image.name  # Store for results
 
         # Determine processing order
         if self.config.process_reverse:
