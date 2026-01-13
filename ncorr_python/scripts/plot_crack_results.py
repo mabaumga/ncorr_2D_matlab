@@ -30,9 +30,28 @@ sys.path.insert(0, str(Path(__file__).parent))
 from batch_crack_analysis import CrackAnalysisResult, AnalysisConfig
 
 
+def get_ffmpeg_path() -> Optional[str]:
+    """Get FFmpeg executable path, checking PATH and imageio-ffmpeg."""
+    # First check system PATH
+    ffmpeg_path = shutil.which('ffmpeg')
+    if ffmpeg_path:
+        return ffmpeg_path
+
+    # Try imageio-ffmpeg package
+    try:
+        import imageio_ffmpeg
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        if ffmpeg_path:
+            return ffmpeg_path
+    except ImportError:
+        pass
+
+    return None
+
+
 def is_ffmpeg_available() -> bool:
-    """Check if FFmpeg is available in PATH."""
-    return shutil.which('ffmpeg') is not None
+    """Check if FFmpeg is available."""
+    return get_ffmpeg_path() is not None
 
 
 def load_results(results_dir: Path) -> Tuple[List[CrackAnalysisResult], dict]:
@@ -173,16 +192,19 @@ def create_heatmap_video(
     output_path = Path(output_path)
 
     # Check if FFmpeg is available for MP4 output
-    use_ffmpeg = output_path.suffix.lower() != '.gif' and is_ffmpeg_available()
+    ffmpeg_path = get_ffmpeg_path()
+    use_ffmpeg = output_path.suffix.lower() != '.gif' and ffmpeg_path is not None
 
-    if output_path.suffix.lower() != '.gif' and not is_ffmpeg_available():
-        print("FFmpeg not found in PATH. Falling back to GIF format.")
-        print("To enable MP4: Install FFmpeg and add it to your PATH, then restart terminal.")
+    if output_path.suffix.lower() != '.gif' and ffmpeg_path is None:
+        print("FFmpeg not found. Falling back to GIF format.")
+        print("To enable MP4: pip install imageio-ffmpeg")
         output_path = output_path.with_suffix('.gif')
 
     print(f"Saving video to {output_path}...")
 
     if use_ffmpeg:
+        # Configure matplotlib to use the found FFmpeg path
+        plt.rcParams['animation.ffmpeg_path'] = ffmpeg_path
         writer = FFMpegWriter(fps=fps, metadata={'title': 'Crack Analysis'})
     else:
         writer = PillowWriter(fps=fps)
