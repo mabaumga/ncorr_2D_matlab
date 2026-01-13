@@ -22,6 +22,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
+from scipy.ndimage import gaussian_filter, gaussian_filter1d
 from tqdm import tqdm
 
 # Import result class
@@ -288,6 +289,185 @@ def create_displacement_curves(
     print(f"Displacement curves saved: {output_path}")
 
 
+def create_refined_crack_analysis(
+    results: List[CrackAnalysisResult],
+    config: dict,
+    output_path: Path,
+    crack_margin_mm: float = 2.0,
+    sigma_x: float = 3.0,
+    sigma_time: float = 2.0,
+    dpi: int = 150,
+    use_physical_coords: bool = True,
+):
+    """
+    Create refined crack analysis with three panels:
+    1. Raw data (max relative displacement vs x)
+    2. Refined ROI (focused on crack region from final image)
+    3. Smoothed data (2D Gaussian filter over x and time)
+
+    Args:
+        results: List of analysis results (sorted by image index)
+        config: Analysis configuration
+        output_path: Path for output figure
+        crack_margin_mm: Margin around detected crack region in mm
+        sigma_x: Gaussian smoothing sigma along x-axis (in grid points)
+        sigma_time: Gaussian smoothing sigma along time axis (in images)
+        dpi: Resolution
+        use_physical_coords: Use mm coordinates instead of pixels
+    """
+    if not results or len(results) < 2:
+        print("Need at least 2 results for refined analysis")
+        return
+
+    # Sort results by image index
+    results = sorted(results, key=lambda r: r.image_index)
+    n_images = len(results)
+
+    # Get coordinates
+    r0 = results[0]
+    if use_physical_coords:
+        x_coords = r0.grid_x_mm
+        y_coords = r0.grid_y_mm
+        pixels_per_mm = config.get('pixels_per_mm', 50.0)
+        crack_margin_idx = int(crack_margin_mm * pixels_per_mm / config.get('grid_step', 4))
+    else:
+        x_coords = r0.grid_x
+        y_coords = r0.grid_y
+        crack_margin_idx = int(crack_margin_mm * 50 / 4)  # Approximate
+
+    nx = len(x_coords)
+    ny = len(y_coords)
+    coord_unit = "mm" if use_physical_coords else "px"
+    ref_distance = config.get('reference_distance_mm', 1.0)
+
+    # =========================================================================
+    # Step 1: Build raw data matrix (n_images x nx)
+    # =========================================================================
+    raw_data = np.zeros((n_images, nx))
+    for i, r in enumerate(results):
+        raw_data[i, :] = r.max_relative_v_per_x
+
+    # =========================================================================
+    # Step 2: Identify crack region from LAST image (largest crack)
+    # =========================================================================
+    last_result = results[-1]
+    rel_v_last = last_result.relative_v  # 2D array (ny, nx)
+
+    # Find y-position of max displacement for each x in last image
+    crack_y_positions = last_result.max_relative_v_y_position  # in pixels
+
+    # Determine crack region bounds (y indices where crack is detected)
+    valid_crack_y = crack_y_positions[~np.isnan(crack_y_positions)]
+    if len(valid_crack_y) == 0:
+        print("No valid crack positions detected in last image")
+        return
+
+    # Convert to grid indices
+    grid_step = config.get('grid_step', 4)
+    crack_y_min_px = np.nanmin(valid_crack_y)
+    crack_y_max_px = np.nanmax(valid_crack_y)
+
+    # Convert to y-index in grid
+    crack_y_min_idx = max(0, int(crack_y_min_px / grid_step) - crack_margin_idx)
+    crack_y_max_idx = min(ny - 1, int(crack_y_max_px / grid_step) + crack_margin_idx)
+
+    print(f"Detected crack region: y = {y_coords[crack_y_min_idx]:.1f} to {y_coords[crack_y_max_idx]:.1f} {coord_unit}")
+
+    # =========================================================================
+    # Step 3: Compute refined data (average in crack region instead of max)
+    # =========================================================================
+    refined_data = np.zeros((n_images, nx))
+
+    for i, r in enumerate(results):
+        rel_v = r.relative_v  # 2D array (ny, nx)
+        # Extract crack region and take mean of absolute values
+        crack_region = rel_v[crack_y_min_idx:crack_y_max_idx+1, :]
+        # Use max in the crack region (more robust than mean for crack detection)
+        with np.errstate(all='ignore'):
+            refined_data[i, :] = np.nanmax(np.abs(crack_region), axis=0)
+
+    # =========================================================================
+    # Step 4: Apply 2D Gaussian smoothing
+    # =========================================================================
+    # Handle NaN values for filtering
+    smoothed_data = refined_data.copy()
+
+    # Replace NaN with interpolated values for smoothing
+    nan_mask = np.isnan(smoothed_data)
+    if np.any(nan_mask):
+        # Simple interpolation: replace NaN with column mean
+        col_means = np.nanmean(smoothed_data, axis=0)
+        for j in range(nx):
+            smoothed_data[nan_mask[:, j], j] = col_means[j]
+
+    # Apply 2D Gaussian filter (sigma_time along axis 0, sigma_x along axis 1)
+    smoothed_data = gaussian_filter(smoothed_data, sigma=[sigma_time, sigma_x])
+
+    # Restore NaN where original was NaN
+    smoothed_data[nan_mask] = np.nan
+
+    # Physical constraint: first image should have ~zero displacement
+    # Subtract baseline (small smoothed offset from first few images)
+    baseline = np.nanmean(smoothed_data[:3, :], axis=0)
+    smoothed_data = smoothed_data - baseline[np.newaxis, :]
+    smoothed_data = np.maximum(smoothed_data, 0)  # Crack opening is positive
+
+    # =========================================================================
+    # Step 5: Create three-panel figure
+    # =========================================================================
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    # Color settings
+    n_curves = n_images
+    colors = plt.cm.viridis(np.linspace(0, 1, n_curves))
+
+    # Panel 1: Raw data
+    ax1 = axes[0]
+    for i in range(n_images):
+        ax1.plot(x_coords, raw_data[i, :], color=colors[i], alpha=0.7, linewidth=0.8)
+    ax1.set_xlabel(f"x [{coord_unit}]")
+    ax1.set_ylabel(f"Max. relative y-displacement [px]")
+    ax1.set_title(f"Raw data\n(max over all y)")
+    ax1.grid(True, alpha=0.3)
+
+    # Panel 2: Refined (crack region only)
+    ax2 = axes[1]
+    for i in range(n_images):
+        ax2.plot(x_coords, refined_data[i, :], color=colors[i], alpha=0.7, linewidth=0.8)
+    ax2.set_xlabel(f"x [{coord_unit}]")
+    ax2.set_ylabel(f"Max. relative y-displacement [px]")
+    ax2.set_title(f"Refined ROI\n(crack region: y = {y_coords[crack_y_min_idx]:.1f}-{y_coords[crack_y_max_idx]:.1f} {coord_unit})")
+    ax2.grid(True, alpha=0.3)
+
+    # Panel 3: Smoothed data
+    ax3 = axes[2]
+    for i in range(n_images):
+        ax3.plot(x_coords, smoothed_data[i, :], color=colors[i], alpha=0.7, linewidth=0.8)
+    ax3.set_xlabel(f"x [{coord_unit}]")
+    ax3.set_ylabel(f"Smoothed relative y-displacement [px]")
+    ax3.set_title(f"Smoothed data\n(σ_x={sigma_x:.1f}, σ_t={sigma_time:.1f}, baseline corrected)")
+    ax3.grid(True, alpha=0.3)
+
+    # Add colorbar for image progression
+    sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis, norm=mcolors.Normalize(vmin=1, vmax=n_curves))
+    cbar = fig.colorbar(sm, ax=axes, location='right', shrink=0.8, pad=0.02)
+    cbar.set_label("Image number")
+
+    plt.suptitle(f"Crack Analysis - Relative y-displacement (over {ref_distance:.1f} mm)", fontsize=12, y=1.02)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Refined crack analysis saved: {output_path}")
+
+    return {
+        'raw_data': raw_data,
+        'refined_data': refined_data,
+        'smoothed_data': smoothed_data,
+        'crack_y_range': (crack_y_min_idx, crack_y_max_idx),
+        'x_coords': x_coords,
+    }
+
+
 def create_max_displacement_evolution(
     results: List[CrackAnalysisResult],
     config: dict,
@@ -469,6 +649,24 @@ def main():
         action="store_true",
         help="Use pixel coordinates instead of mm"
     )
+    parser.add_argument(
+        "--crack-margin",
+        type=float,
+        default=2.0,
+        help="Margin around crack region in mm (default: 2.0)"
+    )
+    parser.add_argument(
+        "--sigma-x",
+        type=float,
+        default=3.0,
+        help="Gaussian smoothing sigma along x-axis (default: 3.0)"
+    )
+    parser.add_argument(
+        "--sigma-time",
+        type=float,
+        default=2.0,
+        help="Gaussian smoothing sigma along time axis (default: 2.0)"
+    )
 
     args = parser.parse_args()
 
@@ -501,7 +699,18 @@ def main():
         use_physical_coords=use_physical,
     )
 
-    # 2. Max displacement evolution
+    # 2. Refined crack analysis (three-panel comparison)
+    create_refined_crack_analysis(
+        results, config,
+        output_dir / "refined_crack_analysis.png",
+        crack_margin_mm=args.crack_margin,
+        sigma_x=args.sigma_x,
+        sigma_time=args.sigma_time,
+        dpi=args.dpi,
+        use_physical_coords=use_physical,
+    )
+
+    # 3. Max displacement evolution
     create_max_displacement_evolution(
         results, config,
         output_dir / "max_displacement_evolution.png",
@@ -509,7 +718,7 @@ def main():
         use_physical_coords=use_physical,
     )
 
-    # 3. Crack position plot
+    # 4. Crack position plot
     create_crack_position_plot(
         results, config,
         output_dir / "crack_propagation.png",
@@ -518,7 +727,7 @@ def main():
         use_physical_coords=use_physical,
     )
 
-    # 4. Heatmap video (optional)
+    # 5. Heatmap video (optional)
     if not args.no_video:
         create_heatmap_video(
             results, config,
