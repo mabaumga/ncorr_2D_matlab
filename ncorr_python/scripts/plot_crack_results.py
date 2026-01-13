@@ -298,6 +298,7 @@ def create_refined_crack_analysis(
     sigma_time: float = 2.0,
     dpi: int = 150,
     use_physical_coords: bool = True,
+    title: Optional[str] = None,
 ):
     """
     Create refined crack analysis with three panels:
@@ -314,6 +315,7 @@ def create_refined_crack_analysis(
         sigma_time: Gaussian smoothing sigma along time axis (in images)
         dpi: Resolution
         use_physical_coords: Use mm coordinates instead of pixels
+        title: Custom title (default: parent directory name)
     """
     if not results or len(results) < 2:
         print("Need at least 2 results for refined analysis")
@@ -323,22 +325,30 @@ def create_refined_crack_analysis(
     results = sorted(results, key=lambda r: r.image_index)
     n_images = len(results)
 
-    # Get coordinates
+    # Get coordinates - always use PIXELS for x-axis display
     r0 = results[0]
-    if use_physical_coords:
-        x_coords = r0.grid_x_mm
-        y_coords = r0.grid_y_mm
-        pixels_per_mm = config.get('pixels_per_mm', 50.0)
-        crack_margin_idx = int(crack_margin_mm * pixels_per_mm / config.get('grid_step', 4))
-    else:
-        x_coords = r0.grid_x
-        y_coords = r0.grid_y
-        crack_margin_idx = int(crack_margin_mm * 50 / 4)  # Approximate
+    x_coords = r0.grid_x  # Always pixels
+    y_coords = r0.grid_y  # Always pixels
+
+    # Calculate crack margin in grid indices
+    pixels_per_mm = config.get('pixels_per_mm', 50.0)
+    grid_step = config.get('grid_step', 4)
+    crack_margin_idx = int(crack_margin_mm * pixels_per_mm / grid_step)
 
     nx = len(x_coords)
     ny = len(y_coords)
-    coord_unit = "mm" if use_physical_coords else "px"
     ref_distance = config.get('reference_distance_mm', 1.0)
+
+    # Determine title: use provided title, or parent directory name
+    output_path = Path(output_path)
+    if title is None:
+        # Get parent directory of the results folder
+        # e.g., "FN3_2_75-86/results/file.png" -> "FN3_2_75-86"
+        parent_dir = output_path.parent
+        if parent_dir.name in ('results', 'output', 'ergebnisse'):
+            title = parent_dir.parent.name
+        else:
+            title = parent_dir.name
 
     # =========================================================================
     # Step 1: Build raw data matrix (n_images x nx)
@@ -425,36 +435,39 @@ def create_refined_crack_analysis(
     ax1 = axes[0]
     for i in range(n_images):
         ax1.plot(x_coords, raw_data[i, :], color=colors[i], alpha=0.7, linewidth=0.8)
-    ax1.set_xlabel(f"x [{coord_unit}]")
-    ax1.set_ylabel(f"Max. relative y-displacement [px]")
-    ax1.set_title(f"Raw data\n(max over all y)")
+    ax1.set_xlabel("x [px]")
+    ax1.set_ylabel("Max. relative y-displacement [px]")
+    ax1.set_title("Raw data\n(max over all y)")
     ax1.grid(True, alpha=0.3)
 
     # Panel 2: Refined (crack region only)
     ax2 = axes[1]
     for i in range(n_images):
         ax2.plot(x_coords, refined_data[i, :], color=colors[i], alpha=0.7, linewidth=0.8)
-    ax2.set_xlabel(f"x [{coord_unit}]")
-    ax2.set_ylabel(f"Max. relative y-displacement [px]")
-    ax2.set_title(f"Refined ROI\n(crack region: y = {y_coords[crack_y_min_idx]:.1f}-{y_coords[crack_y_max_idx]:.1f} {coord_unit})")
+    ax2.set_xlabel("x [px]")
+    ax2.set_ylabel("Max. relative y-displacement [px]")
+    ax2.set_title(f"Refined ROI\n(crack region: y = {y_coords[crack_y_min_idx]:.0f}-{y_coords[crack_y_max_idx]:.0f} px)")
     ax2.grid(True, alpha=0.3)
 
     # Panel 3: Smoothed data
     ax3 = axes[2]
     for i in range(n_images):
         ax3.plot(x_coords, smoothed_data[i, :], color=colors[i], alpha=0.7, linewidth=0.8)
-    ax3.set_xlabel(f"x [{coord_unit}]")
-    ax3.set_ylabel(f"Smoothed relative y-displacement [px]")
+    ax3.set_xlabel("x [px]")
+    ax3.set_ylabel("Smoothed relative y-displacement [px]")
     ax3.set_title(f"Smoothed data\n(σ_x={sigma_x:.1f}, σ_t={sigma_time:.1f}, baseline corrected)")
     ax3.grid(True, alpha=0.3)
 
-    # Add colorbar for image progression
+    # Add colorbar for image progression - placed outside on the right
     sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis, norm=mcolors.Normalize(vmin=1, vmax=n_curves))
-    cbar = fig.colorbar(sm, ax=axes, location='right', shrink=0.8, pad=0.02)
+    sm.set_array([])  # Required for ScalarMappable
+    # Create space for colorbar on the right side
+    fig.subplots_adjust(right=0.92)
+    cbar_ax = fig.add_axes([0.94, 0.15, 0.02, 0.7])  # [left, bottom, width, height]
+    cbar = fig.colorbar(sm, cax=cbar_ax)
     cbar.set_label("Image number")
 
-    plt.suptitle(f"Crack Analysis - Relative y-displacement (over {ref_distance:.1f} mm)", fontsize=12, y=1.02)
-    plt.tight_layout()
+    plt.suptitle(f"{title}", fontsize=14, fontweight='bold', y=0.98)
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
     plt.close(fig)
     print(f"Refined crack analysis saved: {output_path}")
@@ -667,6 +680,12 @@ def main():
         default=2.0,
         help="Gaussian smoothing sigma along time axis (default: 2.0)"
     )
+    parser.add_argument(
+        "--title",
+        type=str,
+        default=None,
+        help="Custom title for plots (default: parent directory name)"
+    )
 
     args = parser.parse_args()
 
@@ -708,6 +727,7 @@ def main():
         sigma_time=args.sigma_time,
         dpi=args.dpi,
         use_physical_coords=use_physical,
+        title=args.title,
     )
 
     # 3. Max displacement evolution
