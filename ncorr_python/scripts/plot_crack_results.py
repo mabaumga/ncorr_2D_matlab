@@ -167,18 +167,23 @@ def create_heatmap_video(
     output_path = Path(output_path)
     print(f"Saving video to {output_path}...")
 
-    if output_path.suffix.lower() == '.gif':
-        writer = PillowWriter(fps=fps)
-    else:
+    # Try to save as MP4 first, fall back to GIF if FFmpeg not available
+    saved = False
+
+    if output_path.suffix.lower() != '.gif':
         try:
             writer = FFMpegWriter(fps=fps, metadata={'title': 'Crack Analysis'})
-        except Exception:
-            # Fallback to GIF if FFmpeg not available
+            anim.save(output_path, writer=writer, dpi=dpi)
+            saved = True
+        except (FileNotFoundError, OSError) as e:
+            print(f"FFmpeg not available ({e}), falling back to GIF...")
             output_path = output_path.with_suffix('.gif')
-            writer = PillowWriter(fps=fps)
-            print(f"FFmpeg not available, saving as GIF: {output_path}")
 
-    anim.save(output_path, writer=writer, dpi=dpi)
+    if not saved:
+        # Use GIF format
+        writer = PillowWriter(fps=fps)
+        anim.save(output_path, writer=writer, dpi=dpi)
+
     plt.close(fig)
     print(f"Video saved: {output_path}")
 
