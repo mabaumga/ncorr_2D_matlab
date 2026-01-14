@@ -55,6 +55,41 @@ def is_ffmpeg_available() -> bool:
     return get_ffmpeg_path() is not None
 
 
+def _isotonic_regression_pava(y: np.ndarray) -> np.ndarray:
+    """
+    Pool Adjacent Violators Algorithm for isotonic regression.
+
+    Enforces monotonically increasing values.
+
+    Args:
+        y: Input array
+
+    Returns:
+        Monotonically increasing array
+    """
+    n = len(y)
+    y_iso = y.copy().astype(float)
+
+    # Forward pass: merge violations
+    i = 0
+    while i < n - 1:
+        if y_iso[i] > y_iso[i + 1]:
+            # Found a violation - pool and average
+            j = i + 1
+            while j < n and y_iso[i] > y_iso[j]:
+                j += 1
+            # Average the pooled region
+            avg = np.mean(y_iso[i:j])
+            y_iso[i:j] = avg
+            # Go back to check if new average creates violation
+            if i > 0:
+                i -= 1
+        else:
+            i += 1
+
+    return y_iso
+
+
 def load_results(results_dir: Path) -> Tuple[List[CrackAnalysisResult], dict]:
     """
     Load all results from a results directory.
@@ -296,6 +331,7 @@ def create_refined_crack_analysis(
     crack_margin_mm: float = 2.0,
     sigma_x: float = 3.0,
     sigma_time: float = 2.0,
+    smoothing_method: str = "gaussian",
     dpi: int = 150,
     use_physical_coords: bool = True,
     title: Optional[str] = None,
@@ -304,7 +340,7 @@ def create_refined_crack_analysis(
     Create refined crack analysis with three panels:
     1. Raw data (max relative displacement vs x)
     2. Refined ROI (focused on crack region from final image)
-    3. Smoothed data (2D Gaussian filter over x and time)
+    3. Smoothed data (Gaussian or isotonic regression)
 
     Args:
         results: List of analysis results (sorted by image index)
@@ -313,6 +349,7 @@ def create_refined_crack_analysis(
         crack_margin_mm: Margin around detected crack region in mm
         sigma_x: Gaussian smoothing sigma along x-axis (in grid points)
         sigma_time: Gaussian smoothing sigma along time axis (in images)
+        smoothing_method: "gaussian" or "isotonic"
         dpi: Resolution
         use_physical_coords: Use mm coordinates instead of pixels
         title: Custom title (default: parent directory name)
@@ -397,27 +434,68 @@ def create_refined_crack_analysis(
             refined_data[i, :] = np.nanmax(np.abs(crack_region), axis=0)
 
     # =========================================================================
-    # Step 4: Apply 2D Gaussian smoothing
+    # Step 4: Apply smoothing (Gaussian or Isotonic)
     # =========================================================================
-    # Handle NaN values for filtering
     smoothed_data = refined_data.copy()
-
-    # Replace NaN with interpolated values for smoothing
     nan_mask = np.isnan(smoothed_data)
-    if np.any(nan_mask):
-        # Simple interpolation: replace NaN with column mean
-        col_means = np.nanmean(smoothed_data, axis=0)
+
+    if smoothing_method == "isotonic":
+        # Isotonic regression: enforce monotonic increase over time
+        # This is physically motivated - crack opening should only grow
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            ir = IsotonicRegression(increasing=True)
+        except ImportError:
+            print("sklearn not installed. Falling back to manual isotonic regression.")
+            ir = None
+
         for j in range(nx):
-            smoothed_data[nan_mask[:, j], j] = col_means[j]
+            col = smoothed_data[:, j]
+            valid = ~np.isnan(col)
+            if np.sum(valid) < 2:
+                continue
 
-    # Apply 2D Gaussian filter (sigma_time along axis 0, sigma_x along axis 1)
-    smoothed_data = gaussian_filter(smoothed_data, sigma=[sigma_time, sigma_x])
+            x_valid = np.where(valid)[0]
+            y_valid = col[valid]
 
-    # Restore NaN where original was NaN
-    smoothed_data[nan_mask] = np.nan
+            if ir is not None:
+                # Use sklearn
+                y_isotonic = ir.fit_transform(x_valid, y_valid)
+            else:
+                # Manual Pool Adjacent Violators Algorithm (PAVA)
+                y_isotonic = _isotonic_regression_pava(y_valid)
+
+            col[valid] = y_isotonic
+            smoothed_data[:, j] = col
+
+        # Apply spatial smoothing along x-axis only
+        if sigma_x > 0:
+            for i in range(n_images):
+                row = smoothed_data[i, :]
+                valid = ~np.isnan(row)
+                if np.sum(valid) > 3:
+                    row[valid] = gaussian_filter1d(row[valid], sigma=sigma_x)
+                    smoothed_data[i, :] = row
+
+        smoothing_label = "isotonic + σ_x={:.1f}".format(sigma_x)
+
+    else:  # Gaussian smoothing
+        # Replace NaN with interpolated values for smoothing
+        if np.any(nan_mask):
+            col_means = np.nanmean(smoothed_data, axis=0)
+            for j in range(nx):
+                smoothed_data[nan_mask[:, j], j] = col_means[j]
+
+        # Apply 2D Gaussian filter (sigma_time along axis 0, sigma_x along axis 1)
+        smoothed_data = gaussian_filter(smoothed_data, sigma=[sigma_time, sigma_x])
+
+        # Restore NaN where original was NaN
+        smoothed_data[nan_mask] = np.nan
+
+        smoothing_label = f"σ_x={sigma_x:.1f}, σ_t={sigma_time:.1f}"
 
     # Physical constraint: first image should have ~zero displacement
-    # Subtract baseline (small smoothed offset from first few images)
+    # Subtract baseline (small offset from first few images)
     baseline = np.nanmean(smoothed_data[:3, :], axis=0)
     smoothed_data = smoothed_data - baseline[np.newaxis, :]
     smoothed_data = np.maximum(smoothed_data, 0)  # Crack opening is positive
@@ -455,7 +533,7 @@ def create_refined_crack_analysis(
         ax3.plot(x_coords, smoothed_data[i, :], color=colors[i], alpha=0.7, linewidth=0.8)
     ax3.set_xlabel("x [px]")
     ax3.set_ylabel("Smoothed relative y-displacement [px]")
-    ax3.set_title(f"Smoothed data\n(σ_x={sigma_x:.1f}, σ_t={sigma_time:.1f}, baseline corrected)")
+    ax3.set_title(f"Smoothed data\n({smoothing_label}, baseline corrected)")
     ax3.grid(True, alpha=0.3)
 
     # Add colorbar for image progression - placed outside on the right
@@ -681,6 +759,13 @@ def main():
         help="Gaussian smoothing sigma along time axis (default: 2.0)"
     )
     parser.add_argument(
+        "--smoothing",
+        type=str,
+        choices=["gaussian", "isotonic"],
+        default="gaussian",
+        help="Smoothing method: 'gaussian' (2D filter) or 'isotonic' (monotonic increase over time)"
+    )
+    parser.add_argument(
         "--title",
         type=str,
         default=None,
@@ -725,6 +810,7 @@ def main():
         crack_margin_mm=args.crack_margin,
         sigma_x=args.sigma_x,
         sigma_time=args.sigma_time,
+        smoothing_method=args.smoothing,
         dpi=args.dpi,
         use_physical_coords=use_physical,
         title=args.title,
