@@ -250,80 +250,6 @@ def create_heatmap_video(
     print(f"Video saved: {output_path}")
 
 
-def create_displacement_curves(
-    results: List[CrackAnalysisResult],
-    config: dict,
-    output_path: Path,
-    dpi: int = 150,
-    use_physical_coords: bool = True,
-):
-    """
-    Create plot of maximum relative displacement vs x-coordinate for all images.
-
-    Each curve represents one image, with colors from viridis colormap.
-    Shows the maximum relative y-displacement at each x-position (crack opening).
-
-    Args:
-        results: List of analysis results
-        config: Analysis configuration
-        output_path: Path for output figure
-        dpi: Resolution
-        use_physical_coords: Use mm coordinates instead of pixels
-    """
-    if not results:
-        print("No results to visualize")
-        return
-
-    # Set up figure
-    fig, ax = plt.subplots(figsize=(12, 8))
-
-    # Color map for curves
-    n_curves = len(results)
-    colors = plt.cm.viridis(np.linspace(0, 1, n_curves))
-
-    # Plot each curve - max relative displacement vs x
-    for i, r in enumerate(results):
-        if use_physical_coords:
-            x_coords = r.grid_x_mm
-        else:
-            x_coords = r.grid_x
-
-        # Use the pre-computed max relative displacement per x-position
-        max_rel_v = r.max_relative_v_per_x
-
-        # Plot with color from viridis
-        ax.plot(
-            x_coords, max_rel_v,
-            color=colors[i],
-            alpha=0.7,
-            linewidth=0.8,
-            label=f"Image {r.image_index}" if i % max(1, n_curves // 10) == 0 else None
-        )
-
-    # Labels
-    ref_distance = config.get('reference_distance_mm', 1.0)
-    coord_unit = "mm" if use_physical_coords else "px"
-
-    ax.set_xlabel(f"x [{coord_unit}]")
-    ax.set_ylabel(f"Max. relative y-displacement [px]")
-    ax.set_title(f"Maximum relative y-displacement (over {ref_distance:.1f} mm) vs x-position")
-
-    # Colorbar for image progression
-    sm = plt.cm.ScalarMappable(
-        cmap=plt.cm.viridis,
-        norm=mcolors.Normalize(vmin=1, vmax=n_curves)
-    )
-    cbar = fig.colorbar(sm, ax=ax)
-    cbar.set_label("Image number")
-
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=dpi)
-    plt.close(fig)
-    print(f"Displacement curves saved: {output_path}")
-
-
 def create_refined_crack_analysis(
     results: List[CrackAnalysisResult],
     config: dict,
@@ -559,142 +485,109 @@ def create_refined_crack_analysis(
     }
 
 
-def create_max_displacement_evolution(
+def create_damage_evolution(
     results: List[CrackAnalysisResult],
     config: dict,
-    output_path: Path,
+    plot_path: Path,
+    data_path: Path,
     dpi: int = 150,
-    use_physical_coords: bool = True,
 ):
     """
-    Create plot showing evolution of maximum relative displacement per x-position.
+    Create damage evolution plot with two y-axes:
+    - Left axis: Maximum relative displacement per image (absolute values in pixels)
+    - Right axis: Normalized damage ratio (0 to 1) vs. relative image number (0 to 1)
+
+    Also saves the damage ratio array to a numpy file.
 
     Args:
-        results: List of analysis results
+        results: List of analysis results (sorted by image index)
         config: Analysis configuration
-        output_path: Path for output figure
+        plot_path: Path for output figure
+        data_path: Path for saving damage ratio numpy array
         dpi: Resolution
-        use_physical_coords: Use mm coordinates instead of pixels
     """
-    if not results:
-        print("No results to visualize")
+    if not results or len(results) < 2:
+        print("Need at least 2 results for damage evolution analysis")
         return
 
-    # Set up figure with two subplots
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    # Sort results by image index
+    results = sorted(results, key=lambda r: r.image_index)
+    n_images = len(results)
 
-    r0 = results[0]
-    n_curves = len(results)
-    colors = plt.cm.viridis(np.linspace(0, 1, n_curves))
-
-    # Plot max relative displacement vs x for each image
+    # Compute maximum relative displacement for each image
+    # (maximum over all x-positions)
+    max_disp_per_image = np.zeros(n_images)
     for i, r in enumerate(results):
-        if use_physical_coords:
-            x_coords = r.grid_x_mm
-            y_pos = r.max_relative_v_y_position / config.get('pixels_per_mm', 50.0)
+        valid_values = r.max_relative_v_per_x[~np.isnan(r.max_relative_v_per_x)]
+        if len(valid_values) > 0:
+            max_disp_per_image[i] = np.max(np.abs(valid_values))
         else:
-            x_coords = r.grid_x
-            y_pos = r.max_relative_v_y_position
+            max_disp_per_image[i] = np.nan
 
-        ax1.plot(x_coords, r.max_relative_v_per_x, color=colors[i], alpha=0.7, linewidth=0.8)
-        ax2.plot(x_coords, y_pos, color=colors[i], alpha=0.7, linewidth=0.8)
+    # Overall maximum across all images
+    overall_max = np.nanmax(max_disp_per_image)
 
-    # Labels
-    coord_unit = "mm" if use_physical_coords else "px"
-    ref_distance = config.get('reference_distance_mm', 1.0)
+    # Normalized damage ratio: max_disp(image_i) / max_disp(all_images)
+    damage_ratio = max_disp_per_image / overall_max
 
-    ax1.set_ylabel(f"Max relative v [px]")
-    ax1.set_title(f"Maximum relative y-displacement (over {ref_distance:.1f} mm) per x-position")
+    # Relative image number (0 to 1)
+    image_numbers = np.arange(1, n_images + 1)
+    relative_image_number = (image_numbers - 1) / (n_images - 1)  # 0 to 1
+
+    # Save damage ratio data
+    np.save(data_path, {
+        'image_numbers': image_numbers,
+        'relative_image_number': relative_image_number,
+        'max_displacement_per_image': max_disp_per_image,
+        'damage_ratio': damage_ratio,
+        'overall_max_displacement': overall_max,
+    })
+    print(f"Damage ratio data saved: {data_path}")
+
+    # Create figure with two y-axes
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+    ax2 = ax1.twinx()
+
+    # Plot 1 (left axis): Max displacement vs image number
+    color1 = 'tab:blue'
+    line1 = ax1.plot(image_numbers, max_disp_per_image, 'o-', color=color1,
+                     markersize=4, linewidth=1.5, label='Max. rel. displacement')
+    ax1.set_xlabel('Image number')
+    ax1.set_ylabel('Max. relative displacement [px]', color=color1)
+    ax1.tick_params(axis='y', labelcolor=color1)
+    ax1.set_xlim(0, n_images + 1)
+    ax1.set_ylim(bottom=0)
+
+    # Plot 2 (right axis): Damage ratio vs relative image number
+    # We create a secondary x-axis at the top for relative image number
+    ax_top = ax1.secondary_xaxis('top', functions=(
+        lambda x: (x - 1) / (n_images - 1) if n_images > 1 else 0,
+        lambda x: x * (n_images - 1) + 1
+    ))
+    ax_top.set_xlabel('Relative image number')
+
+    color2 = 'tab:red'
+    line2 = ax2.plot(image_numbers, damage_ratio, 's--', color=color2,
+                     markersize=4, linewidth=1.5, label='Damage ratio')
+    ax2.set_ylabel('Damage ratio (normalized)', color=color2)
+    ax2.tick_params(axis='y', labelcolor=color2)
+    ax2.set_ylim(0, 1.05)
+
+    # Combined legend
+    lines = line1 + line2
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='lower right')
+
+    # Grid on primary axis only
     ax1.grid(True, alpha=0.3)
 
-    ax2.set_xlabel(f"x [{coord_unit}]")
-    ax2.set_ylabel(f"y-position of max [{coord_unit}]")
-    ax2.set_title("y-position of maximum relative displacement (crack location)")
-    ax2.grid(True, alpha=0.3)
-
-    # Colorbar
-    sm = plt.cm.ScalarMappable(
-        cmap=plt.cm.viridis,
-        norm=mcolors.Normalize(vmin=1, vmax=n_curves)
-    )
-    cbar = fig.colorbar(sm, ax=[ax1, ax2], location='right', pad=0.02)
-    cbar.set_label("Image number")
+    ref_distance = config.get('reference_distance_mm', 1.0)
+    plt.title(f'Damage Evolution\n(relative displacement over {ref_distance:.1f} mm)')
 
     plt.tight_layout()
-    plt.savefig(output_path, dpi=dpi)
+    plt.savefig(plot_path, dpi=dpi)
     plt.close(fig)
-    print(f"Max displacement evolution saved: {output_path}")
-
-
-def create_crack_position_plot(
-    results: List[CrackAnalysisResult],
-    config: dict,
-    output_path: Path,
-    threshold: float = 0.5,
-    dpi: int = 150,
-    use_physical_coords: bool = True,
-):
-    """
-    Create plot showing crack tip position over cycles.
-
-    The crack tip is estimated as the leftmost x-position where
-    max relative displacement exceeds a threshold.
-
-    Args:
-        results: List of analysis results
-        config: Analysis configuration
-        output_path: Path for output figure
-        threshold: Threshold for crack detection (in pixels)
-        dpi: Resolution
-        use_physical_coords: Use mm coordinates instead of pixels
-    """
-    if not results:
-        print("No results to visualize")
-        return
-
-    r0 = results[0]
-    pixels_per_mm = config.get('pixels_per_mm', 50.0)
-
-    # Find crack tip for each image
-    image_indices = []
-    crack_tips = []
-
-    for r in results:
-        if use_physical_coords:
-            x_coords = r.grid_x_mm
-        else:
-            x_coords = r.grid_x
-
-        # Find where max relative displacement exceeds threshold
-        exceeds = np.abs(r.max_relative_v_per_x) > threshold
-        valid = ~np.isnan(r.max_relative_v_per_x)
-        mask = exceeds & valid
-
-        if np.any(mask):
-            # Leftmost position exceeding threshold
-            crack_tip_idx = np.where(mask)[0][0]
-            crack_tips.append(x_coords[crack_tip_idx])
-            image_indices.append(r.image_index)
-
-    if not crack_tips:
-        print("No crack detected in any image")
-        return
-
-    # Plot
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    ax.plot(image_indices, crack_tips, 'o-', markersize=4)
-
-    coord_unit = "mm" if use_physical_coords else "px"
-    ax.set_xlabel("Image number")
-    ax.set_ylabel(f"Crack tip x-position [{coord_unit}]")
-    ax.set_title(f"Crack propagation (threshold = {threshold:.2f} px)")
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=dpi)
-    plt.close(fig)
-    print(f"Crack position plot saved: {output_path}")
+    print(f"Damage evolution plot saved: {plot_path}")
 
 
 def main():
@@ -723,12 +616,6 @@ def main():
         type=int,
         default=150,
         help="Resolution for plots (default: 150)"
-    )
-    parser.add_argument(
-        "--crack-threshold",
-        type=float,
-        default=0.5,
-        help="Threshold for crack detection in pixels (default: 0.5)"
     )
     parser.add_argument(
         "--no-video",
@@ -795,15 +682,7 @@ def main():
     # Generate plots
     print("\nGenerating plots...")
 
-    # 1. Displacement curves (max relative displacement vs x)
-    create_displacement_curves(
-        results, config,
-        output_dir / "displacement_curves.png",
-        dpi=args.dpi,
-        use_physical_coords=use_physical,
-    )
-
-    # 2. Refined crack analysis (three-panel comparison)
+    # 1. Refined crack analysis (three-panel comparison)
     create_refined_crack_analysis(
         results, config,
         output_dir / "refined_crack_analysis.png",
@@ -816,24 +695,15 @@ def main():
         title=args.title,
     )
 
-    # 3. Max displacement evolution
-    create_max_displacement_evolution(
+    # 2. Damage evolution (max displacement + normalized ratio)
+    create_damage_evolution(
         results, config,
-        output_dir / "max_displacement_evolution.png",
+        output_dir / "damage_evolution.png",
+        output_dir / "damage_ratio.npy",
         dpi=args.dpi,
-        use_physical_coords=use_physical,
     )
 
-    # 4. Crack position plot
-    create_crack_position_plot(
-        results, config,
-        output_dir / "crack_propagation.png",
-        threshold=args.crack_threshold,
-        dpi=args.dpi,
-        use_physical_coords=use_physical,
-    )
-
-    # 5. Heatmap video (optional)
+    # 3. Heatmap video (optional)
     if not args.no_video:
         create_heatmap_video(
             results, config,

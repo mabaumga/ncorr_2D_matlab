@@ -1,0 +1,385 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
+
+\title{Crack Propagation Analysis using Digital Image Correlation\\
+\large Algorithm Description}
+\author{Ncorr Python Implementation}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+\newpage
+
+%=============================================================================
+\section{Overview}
+%=============================================================================
+
+This document describes the algorithm for analyzing crack propagation in image sequences using Digital Image Correlation (DIC). The implementation follows the Inverse Compositional Gauss-Newton (IC-GN) approach as described by Baker and Matthews \cite{baker2004}.
+
+The analysis pipeline consists of the following main steps:
+\begin{enumerate}
+    \item Image loading and preprocessing
+    \item Region of Interest (ROI) definition
+    \item Seed-based DIC analysis using IC-GN
+    \item Displacement field computation
+    \item Strain field computation
+    \item Relative displacement calculation
+    \item Crack detection and visualization
+    \item Data smoothing and output
+\end{enumerate}
+
+%=============================================================================
+\section{Image Loading and Preprocessing}
+%=============================================================================
+
+\subsection{Image Input}
+
+Images are loaded as grayscale arrays $I: \Omega \to [0, 255]$, where $\Omega \subset \mathbb{R}^2$ is the image domain. For color images, conversion to grayscale is performed using:
+\begin{equation}
+    I_\text{gray} = 0.299 \cdot R + 0.587 \cdot G + 0.114 \cdot B
+\end{equation}
+
+\subsection{Reference Image Selection}
+
+The first image in the alphabetically sorted sequence is designated as the \textbf{reference image} $I_{\text{ref}}$. All subsequent images $I_k$ (for $k = 1, 2, \ldots, N$) are compared against this fixed reference.
+
+\subsection{Coordinate System}
+
+The pixel coordinate system uses:
+\begin{itemize}
+    \item Origin at top-left corner
+    \item $x$-axis pointing right (horizontal)
+    \item $y$-axis pointing down (vertical)
+    \item Physical scaling: $s = \frac{W_{\text{px}}}{W_{\text{mm}}}$ [px/mm]
+\end{itemize}
+
+where $W_{\text{px}}$ is the image width in pixels and $W_{\text{mm}}$ is the physical width in millimeters.
+
+%=============================================================================
+\section{Digital Image Correlation (DIC)}
+%=============================================================================
+
+\subsection{Subset Definition}
+
+A subset (or template) is a square region centered at point $(x_0, y_0)$ with radius $r$:
+\begin{equation}
+    S = \{(x, y) : |x - x_0| \leq r \text{ and } |y - y_0| \leq r\}
+\end{equation}
+
+The subset contains $(2r+1)^2$ pixels.
+
+\subsection{Warp Function}
+
+The first-order warp function maps reference coordinates to deformed coordinates:
+\begin{equation}
+    \mathbf{W}(\mathbf{x}; \mathbf{p}) = \begin{pmatrix} x + u + \frac{\partial u}{\partial x}(x - x_0) + \frac{\partial u}{\partial y}(y - y_0) \\ y + v + \frac{\partial v}{\partial x}(x - x_0) + \frac{\partial v}{\partial y}(y - y_0) \end{pmatrix}
+\end{equation}
+
+where $\mathbf{p} = (u, v, \frac{\partial u}{\partial x}, \frac{\partial u}{\partial y}, \frac{\partial v}{\partial x}, \frac{\partial v}{\partial y})^T$ is the parameter vector containing:
+\begin{itemize}
+    \item $u, v$: rigid body translations
+    \item $\frac{\partial u}{\partial x}, \frac{\partial u}{\partial y}, \frac{\partial v}{\partial x}, \frac{\partial v}{\partial y}$: displacement gradients (strain components)
+\end{itemize}
+
+\subsection{Inverse Compositional Gauss-Newton Algorithm}
+
+The IC-GN algorithm minimizes the sum of squared differences (SSD) between the reference and deformed subsets. The cost function is:
+\begin{equation}
+    C(\mathbf{p}) = \sum_{\mathbf{x} \in S} \left[ I_{\text{ref}}(\mathbf{W}(\mathbf{x}; \Delta\mathbf{p})) - I_{\text{cur}}(\mathbf{W}(\mathbf{x}; \mathbf{p})) \right]^2
+\end{equation}
+
+\subsubsection{Zero-Mean Normalized Cross-Correlation (ZNCC)}
+
+To achieve illumination invariance, the correlation coefficient is computed as:
+\begin{equation}
+    \text{ZNCC} = \frac{\sum_{\mathbf{x} \in S} (f(\mathbf{x}) - \bar{f})(g(\mathbf{x}) - \bar{g})}{\sqrt{\sum_{\mathbf{x} \in S} (f(\mathbf{x}) - \bar{f})^2} \cdot \sqrt{\sum_{\mathbf{x} \in S} (g(\mathbf{x}) - \bar{g})^2}}
+\end{equation}
+
+where $f$ is the reference subset, $g$ is the current subset, and $\bar{f}, \bar{g}$ are their respective means.
+
+\subsubsection{Iterative Update}
+
+The parameter update at iteration $n$ is:
+\begin{equation}
+    \Delta\mathbf{p} = -\mathbf{H}^{-1} \sum_{\mathbf{x} \in S} \nabla I_{\text{ref}}(\mathbf{x})^T \frac{\partial \mathbf{W}}{\partial \mathbf{p}} \left[ I_{\text{ref}}(\mathbf{x}) - I_{\text{cur}}(\mathbf{W}(\mathbf{x}; \mathbf{p}^{(n)})) \right]
+\end{equation}
+
+where $\mathbf{H}$ is the Hessian matrix (precomputed from reference image):
+\begin{equation}
+    \mathbf{H} = \sum_{\mathbf{x} \in S} \left( \nabla I_{\text{ref}}(\mathbf{x}) \frac{\partial \mathbf{W}}{\partial \mathbf{p}} \right)^T \left( \nabla I_{\text{ref}}(\mathbf{x}) \frac{\partial \mathbf{W}}{\partial \mathbf{p}} \right)
+\end{equation}
+
+The warp update uses inverse composition:
+\begin{equation}
+    \mathbf{W}(\mathbf{x}; \mathbf{p}^{(n+1)}) = \mathbf{W}(\mathbf{x}; \mathbf{p}^{(n)}) \circ \mathbf{W}(\mathbf{x}; \Delta\mathbf{p})^{-1}
+\end{equation}
+
+\subsubsection{Convergence Criteria}
+
+Iteration stops when either:
+\begin{itemize}
+    \item Norm of update: $\|\Delta\mathbf{p}\| < \epsilon_{\text{diff}}$ (default: $10^{-4}$)
+    \item Maximum iterations reached: $n > n_{\text{max}}$ (default: 50)
+\end{itemize}
+
+\subsection{B-Spline Interpolation}
+
+Sub-pixel intensity values are obtained using bicubic B-spline interpolation. For a point $(x, y)$ with integer part $(i, j)$ and fractional part $(\alpha, \beta)$:
+\begin{equation}
+    I(x, y) = \sum_{m=-1}^{2} \sum_{n=-1}^{2} c_{i+m, j+n} \cdot B_3(\alpha - m) \cdot B_3(\beta - n)
+\end{equation}
+
+where $c_{i,j}$ are the B-spline coefficients and $B_3$ is the cubic B-spline basis function:
+\begin{equation}
+    B_3(t) = \frac{1}{6} \begin{cases}
+        (2-|t|)^3 - 4(1-|t|)^3 & \text{if } |t| < 1 \\
+        (2-|t|)^3 & \text{if } 1 \leq |t| < 2 \\
+        0 & \text{otherwise}
+    \end{cases}
+\end{equation}
+
+\subsection{Seed-Based Propagation}
+
+The analysis starts from a seed point with known initial displacement estimate. The wavefront propagates outward:
+\begin{enumerate}
+    \item Analyze seed point using IC-GN
+    \item Add neighboring unprocessed points to queue
+    \item Use displacement from adjacent analyzed point as initial guess
+    \item Process queue until all points are analyzed
+\end{enumerate}
+
+\subsubsection{Seed Retry Mechanism}
+
+If the initial seed fails (ZNCC < 0.5), alternative positions are tried from a grid:
+\begin{equation}
+    \text{Seed positions} = \{(x_c + k \cdot \Delta x, y_c + l \cdot \Delta y) : k, l \in \{-n, \ldots, n\}\}
+\end{equation}
+
+where $(x_c, y_c)$ is the image center, $\Delta x, \Delta y$ are step sizes, and $n$ is the grid half-size.
+
+%=============================================================================
+\section{Strain Computation}
+%=============================================================================
+
+\subsection{Green-Lagrange Strain Tensor}
+
+The Green-Lagrange strain tensor is computed from the displacement gradients:
+\begin{equation}
+    \mathbf{E} = \frac{1}{2}\left(\mathbf{F}^T\mathbf{F} - \mathbf{I}\right)
+\end{equation}
+
+where $\mathbf{F}$ is the deformation gradient:
+\begin{equation}
+    \mathbf{F} = \mathbf{I} + \nabla\mathbf{u} = \begin{pmatrix} 1 + \frac{\partial u}{\partial x} & \frac{\partial u}{\partial y} \\ \frac{\partial v}{\partial x} & 1 + \frac{\partial v}{\partial y} \end{pmatrix}
+\end{equation}
+
+The strain components are:
+\begin{align}
+    E_{xx} &= \frac{\partial u}{\partial x} + \frac{1}{2}\left[\left(\frac{\partial u}{\partial x}\right)^2 + \left(\frac{\partial v}{\partial x}\right)^2\right] \\
+    E_{yy} &= \frac{\partial v}{\partial y} + \frac{1}{2}\left[\left(\frac{\partial u}{\partial y}\right)^2 + \left(\frac{\partial v}{\partial y}\right)^2\right] \\
+    E_{xy} &= \frac{1}{2}\left(\frac{\partial u}{\partial y} + \frac{\partial v}{\partial x}\right) + \frac{1}{2}\left(\frac{\partial u}{\partial x}\frac{\partial u}{\partial y} + \frac{\partial v}{\partial x}\frac{\partial v}{\partial y}\right)
+\end{align}
+
+\subsection{Local Strain Computation}
+
+Displacement gradients are computed using a local least-squares fit over a circular region with radius $r_s$ (strain radius):
+\begin{equation}
+    \begin{pmatrix} u \\ v \end{pmatrix} = \begin{pmatrix} a_0 + a_1 x + a_2 y \\ b_0 + b_1 x + b_2 y \end{pmatrix}
+\end{equation}
+
+The gradients are then:
+\begin{equation}
+    \frac{\partial u}{\partial x} = a_1, \quad \frac{\partial u}{\partial y} = a_2, \quad \frac{\partial v}{\partial x} = b_1, \quad \frac{\partial v}{\partial y} = b_2
+\end{equation}
+
+%=============================================================================
+\section{Relative Displacement Calculation}
+%=============================================================================
+
+\subsection{Definition}
+
+For crack detection, the \textbf{relative displacement} quantifies the opening between points separated by a reference distance $d$. For each point $(x, y)$:
+\begin{equation}
+    v_{\text{rel}}(x, y) = v\left(x, y + \frac{d}{2}\right) - v\left(x, y - \frac{d}{2}\right)
+\end{equation}
+
+This approximates the strain integrated over distance $d$:
+\begin{equation}
+    v_{\text{rel}} \approx \int_{y-d/2}^{y+d/2} \frac{\partial v}{\partial y} \, dy = d \cdot \bar{\varepsilon}_{yy}
+\end{equation}
+
+\subsection{Grid Implementation}
+
+On a discrete grid with spacing $\Delta$, the number of grid points for half the reference distance is:
+\begin{equation}
+    n_{\text{half}} = \text{round}\left(\frac{d}{2\Delta}\right)
+\end{equation}
+
+The relative displacement at grid point $(i, j)$ is:
+\begin{equation}
+    v_{\text{rel}}[i, j] = v[i + n_{\text{half}}, j] - v[i - n_{\text{half}}, j]
+\end{equation}
+
+\subsection{Maximum Relative Displacement per X-Position}
+
+For each x-position (column $j$), the maximum relative displacement identifies the crack location:
+\begin{equation}
+    v_{\text{max}}[j] = \max_i |v_{\text{rel}}[i, j]|
+\end{equation}
+\begin{equation}
+    y_{\text{crack}}[j] = y_i \text{ where } |v_{\text{rel}}[i, j]| = v_{\text{max}}[j]
+\end{equation}
+
+%=============================================================================
+\section{Post-DIC Coordinate Transformation}
+%=============================================================================
+
+\subsection{Rotation Transformation}
+
+If the specimen is mounted at an angle $\theta$, a coordinate transformation is applied after DIC:
+
+\subsubsection{Displacement Vector Rotation}
+
+The displacement vectors are rotated by angle $\theta$ (counter-clockwise positive):
+\begin{equation}
+    \begin{pmatrix} u' \\ v' \end{pmatrix} = \begin{pmatrix} \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta \end{pmatrix} \begin{pmatrix} u \\ v \end{pmatrix}
+\end{equation}
+
+\subsubsection{Coordinate Rotation}
+
+Coordinates are rotated around the image center $(x_c, y_c)$:
+\begin{align}
+    x' &= (x - x_c)\cos\theta - (y - y_c)\sin\theta + x_c \\
+    y' &= (x - x_c)\sin\theta + (y - y_c)\cos\theta + y_c
+\end{align}
+
+%=============================================================================
+\section{Data Smoothing}
+%=============================================================================
+
+\subsection{Gaussian Smoothing}
+
+A 2D Gaussian filter is applied to the spatio-temporal data matrix $D[t, x]$:
+\begin{equation}
+    D_{\text{smooth}}[t, x] = \sum_{t'} \sum_{x'} D[t', x'] \cdot G_{\sigma_t}(t - t') \cdot G_{\sigma_x}(x - x')
+\end{equation}
+
+where $G_\sigma$ is the Gaussian kernel:
+\begin{equation}
+    G_\sigma(z) = \frac{1}{\sqrt{2\pi}\sigma} \exp\left(-\frac{z^2}{2\sigma^2}\right)
+\end{equation}
+
+Parameters:
+\begin{itemize}
+    \item $\sigma_t$: smoothing along time axis (images)
+    \item $\sigma_x$: smoothing along spatial axis (x-position)
+\end{itemize}
+
+\subsection{Isotonic Regression}
+
+For physically motivated monotonic crack growth, isotonic regression enforces:
+\begin{equation}
+    D_{\text{iso}}[t_1, x] \leq D_{\text{iso}}[t_2, x] \quad \forall t_1 < t_2
+\end{equation}
+
+The Pool Adjacent Violators Algorithm (PAVA) is used:
+\begin{enumerate}
+    \item Scan sequence for violations: $D[t] > D[t+1]$
+    \item Pool violating adjacent values and replace with their mean
+    \item Repeat until monotonic
+\end{enumerate}
+
+\subsection{Baseline Correction}
+
+The baseline (residual displacement in early images) is subtracted:
+\begin{equation}
+    D_{\text{corr}}[t, x] = \max\left(0, D_{\text{smooth}}[t, x] - \frac{1}{3}\sum_{t'=1}^{3} D_{\text{smooth}}[t', x]\right)
+\end{equation}
+
+%=============================================================================
+\section{Damage Evolution Metrics}
+%=============================================================================
+
+\subsection{Maximum Displacement per Image}
+
+The global maximum relative displacement for image $k$:
+\begin{equation}
+    v_{\text{max}}^{(k)} = \max_x v_{\text{max}}[x; k]
+\end{equation}
+
+\subsection{Damage Ratio}
+
+The normalized damage ratio relates each image's maximum to the overall maximum:
+\begin{equation}
+    D_{\text{ratio}}^{(k)} = \frac{v_{\text{max}}^{(k)}}{\max_k v_{\text{max}}^{(k)}}
+\end{equation}
+
+This provides a dimensionless measure of damage progression from 0 (no damage) to 1 (maximum observed damage).
+
+\subsection{Relative Image Number}
+
+For comparing different test sequences, the relative image number normalizes the image index:
+\begin{equation}
+    t_{\text{rel}}^{(k)} = \frac{k - 1}{N - 1}
+\end{equation}
+
+where $N$ is the total number of images. This maps the first image to 0 and the last to 1.
+
+%=============================================================================
+\section{Output Data}
+%=============================================================================
+
+\subsection{Per-Image Results}
+
+For each analyzed image, the following data is stored:
+\begin{itemize}
+    \item Grid coordinates: $\mathbf{x}, \mathbf{y}$ (pixels and mm)
+    \item Displacement fields: $u(x,y), v(x,y)$
+    \item Strain fields: $E_{xx}(x,y), E_{yy}(x,y), E_{xy}(x,y)$
+    \item Relative displacement: $v_{\text{rel}}(x,y)$
+    \item Maximum relative displacement per x: $v_{\text{max}}(x)$
+    \item Crack y-position per x: $y_{\text{crack}}(x)$
+    \item Valid mask: binary array indicating valid measurements
+\end{itemize}
+
+\subsection{Aggregate Results}
+
+\begin{itemize}
+    \item Damage ratio array: $D_{\text{ratio}}^{(k)}$ for all images
+    \item Analysis configuration (JSON)
+    \item Visualization outputs (PNG, MP4/GIF)
+\end{itemize}
+
+%=============================================================================
+\section{References}
+%=============================================================================
+
+\begin{thebibliography}{9}
+\bibitem{baker2004}
+S. Baker and I. Matthews,
+``Lucas-Kanade 20 Years On: A Unifying Framework,''
+\textit{International Journal of Computer Vision}, vol. 56, no. 3, pp. 221--255, 2004.
+
+\bibitem{pan2009}
+B. Pan, K. Qian, H. Xie, and A. Asundi,
+``Two-dimensional digital image correlation for in-plane displacement and strain measurement: a review,''
+\textit{Measurement Science and Technology}, vol. 20, no. 6, p. 062001, 2009.
+
+\bibitem{blaber2015}
+J. Blaber, B. Adair, and A. Antoniou,
+``Ncorr: Open-Source 2D Digital Image Correlation Matlab Software,''
+\textit{Experimental Mechanics}, vol. 55, no. 6, pp. 1105--1122, 2015.
+\end{thebibliography}
+
+\end{document}
