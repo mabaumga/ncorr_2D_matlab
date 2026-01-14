@@ -22,6 +22,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
+from scipy.ndimage import gaussian_filter, gaussian_filter1d
 from tqdm import tqdm
 
 # Import result class
@@ -52,6 +53,41 @@ def get_ffmpeg_path() -> Optional[str]:
 def is_ffmpeg_available() -> bool:
     """Check if FFmpeg is available."""
     return get_ffmpeg_path() is not None
+
+
+def _isotonic_regression_pava(y: np.ndarray) -> np.ndarray:
+    """
+    Pool Adjacent Violators Algorithm for isotonic regression.
+
+    Enforces monotonically increasing values.
+
+    Args:
+        y: Input array
+
+    Returns:
+        Monotonically increasing array
+    """
+    n = len(y)
+    y_iso = y.copy().astype(float)
+
+    # Forward pass: merge violations
+    i = 0
+    while i < n - 1:
+        if y_iso[i] > y_iso[i + 1]:
+            # Found a violation - pool and average
+            j = i + 1
+            while j < n and y_iso[i] > y_iso[j]:
+                j += 1
+            # Average the pooled region
+            avg = np.mean(y_iso[i:j])
+            y_iso[i:j] = avg
+            # Go back to check if new average creates violation
+            if i > 0:
+                i -= 1
+        else:
+            i += 1
+
+    return y_iso
 
 
 def load_results(results_dir: Path) -> Tuple[List[CrackAnalysisResult], dict]:
@@ -288,6 +324,241 @@ def create_displacement_curves(
     print(f"Displacement curves saved: {output_path}")
 
 
+def create_refined_crack_analysis(
+    results: List[CrackAnalysisResult],
+    config: dict,
+    output_path: Path,
+    crack_margin_mm: float = 2.0,
+    sigma_x: float = 3.0,
+    sigma_time: float = 2.0,
+    smoothing_method: str = "gaussian",
+    dpi: int = 150,
+    use_physical_coords: bool = True,
+    title: Optional[str] = None,
+):
+    """
+    Create refined crack analysis with three panels:
+    1. Raw data (max relative displacement vs x)
+    2. Refined ROI (focused on crack region from final image)
+    3. Smoothed data (Gaussian or isotonic regression)
+
+    Args:
+        results: List of analysis results (sorted by image index)
+        config: Analysis configuration
+        output_path: Path for output figure
+        crack_margin_mm: Margin around detected crack region in mm
+        sigma_x: Gaussian smoothing sigma along x-axis (in grid points)
+        sigma_time: Gaussian smoothing sigma along time axis (in images)
+        smoothing_method: "gaussian" or "isotonic"
+        dpi: Resolution
+        use_physical_coords: Use mm coordinates instead of pixels
+        title: Custom title (default: parent directory name)
+    """
+    if not results or len(results) < 2:
+        print("Need at least 2 results for refined analysis")
+        return
+
+    # Sort results by image index
+    results = sorted(results, key=lambda r: r.image_index)
+    n_images = len(results)
+
+    # Get coordinates - always use PIXELS for x-axis display
+    r0 = results[0]
+    x_coords = r0.grid_x  # Always pixels
+    y_coords = r0.grid_y  # Always pixels
+
+    # Calculate crack margin in grid indices
+    pixels_per_mm = config.get('pixels_per_mm', 50.0)
+    grid_step = config.get('grid_step', 4)
+    crack_margin_idx = int(crack_margin_mm * pixels_per_mm / grid_step)
+
+    nx = len(x_coords)
+    ny = len(y_coords)
+    ref_distance = config.get('reference_distance_mm', 1.0)
+
+    # Determine title: use provided title, or parent directory name
+    output_path = Path(output_path)
+    if title is None:
+        # Get parent directory of the results folder
+        # e.g., "FN3_2_75-86/results/file.png" -> "FN3_2_75-86"
+        parent_dir = output_path.parent
+        if parent_dir.name in ('results', 'output', 'ergebnisse'):
+            title = parent_dir.parent.name
+        else:
+            title = parent_dir.name
+
+    # =========================================================================
+    # Step 1: Build raw data matrix (n_images x nx)
+    # =========================================================================
+    raw_data = np.zeros((n_images, nx))
+    for i, r in enumerate(results):
+        raw_data[i, :] = r.max_relative_v_per_x
+
+    # =========================================================================
+    # Step 2: Identify crack region from LAST image (largest crack)
+    # =========================================================================
+    last_result = results[-1]
+    rel_v_last = last_result.relative_v  # 2D array (ny, nx)
+
+    # Find y-position of max displacement for each x in last image
+    crack_y_positions = last_result.max_relative_v_y_position  # in pixels
+
+    # Determine crack region bounds (y indices where crack is detected)
+    valid_crack_y = crack_y_positions[~np.isnan(crack_y_positions)]
+    if len(valid_crack_y) == 0:
+        print("No valid crack positions detected in last image")
+        return
+
+    # Convert to grid indices
+    grid_step = config.get('grid_step', 4)
+    crack_y_min_px = np.nanmin(valid_crack_y)
+    crack_y_max_px = np.nanmax(valid_crack_y)
+
+    # Convert to y-index in grid
+    crack_y_min_idx = max(0, int(crack_y_min_px / grid_step) - crack_margin_idx)
+    crack_y_max_idx = min(ny - 1, int(crack_y_max_px / grid_step) + crack_margin_idx)
+
+    print(f"Detected crack region: y = {y_coords[crack_y_min_idx]:.0f} to {y_coords[crack_y_max_idx]:.0f} px")
+
+    # =========================================================================
+    # Step 3: Compute refined data (average in crack region instead of max)
+    # =========================================================================
+    refined_data = np.zeros((n_images, nx))
+
+    for i, r in enumerate(results):
+        rel_v = r.relative_v  # 2D array (ny, nx)
+        # Extract crack region and take mean of absolute values
+        crack_region = rel_v[crack_y_min_idx:crack_y_max_idx+1, :]
+        # Use max in the crack region (more robust than mean for crack detection)
+        with np.errstate(all='ignore'):
+            refined_data[i, :] = np.nanmax(np.abs(crack_region), axis=0)
+
+    # =========================================================================
+    # Step 4: Apply smoothing (Gaussian or Isotonic)
+    # =========================================================================
+    smoothed_data = refined_data.copy()
+    nan_mask = np.isnan(smoothed_data)
+
+    if smoothing_method == "isotonic":
+        # Isotonic regression: enforce monotonic increase over time
+        # This is physically motivated - crack opening should only grow
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            ir = IsotonicRegression(increasing=True)
+        except ImportError:
+            print("sklearn not installed. Falling back to manual isotonic regression.")
+            ir = None
+
+        for j in range(nx):
+            col = smoothed_data[:, j]
+            valid = ~np.isnan(col)
+            if np.sum(valid) < 2:
+                continue
+
+            x_valid = np.where(valid)[0]
+            y_valid = col[valid]
+
+            if ir is not None:
+                # Use sklearn
+                y_isotonic = ir.fit_transform(x_valid, y_valid)
+            else:
+                # Manual Pool Adjacent Violators Algorithm (PAVA)
+                y_isotonic = _isotonic_regression_pava(y_valid)
+
+            col[valid] = y_isotonic
+            smoothed_data[:, j] = col
+
+        # Apply spatial smoothing along x-axis only
+        if sigma_x > 0:
+            for i in range(n_images):
+                row = smoothed_data[i, :]
+                valid = ~np.isnan(row)
+                if np.sum(valid) > 3:
+                    row[valid] = gaussian_filter1d(row[valid], sigma=sigma_x)
+                    smoothed_data[i, :] = row
+
+        smoothing_label = "isotonic + σ_x={:.1f}".format(sigma_x)
+
+    else:  # Gaussian smoothing
+        # Replace NaN with interpolated values for smoothing
+        if np.any(nan_mask):
+            col_means = np.nanmean(smoothed_data, axis=0)
+            for j in range(nx):
+                smoothed_data[nan_mask[:, j], j] = col_means[j]
+
+        # Apply 2D Gaussian filter (sigma_time along axis 0, sigma_x along axis 1)
+        smoothed_data = gaussian_filter(smoothed_data, sigma=[sigma_time, sigma_x])
+
+        # Restore NaN where original was NaN
+        smoothed_data[nan_mask] = np.nan
+
+        smoothing_label = f"σ_x={sigma_x:.1f}, σ_t={sigma_time:.1f}"
+
+    # Physical constraint: first image should have ~zero displacement
+    # Subtract baseline (small offset from first few images)
+    baseline = np.nanmean(smoothed_data[:3, :], axis=0)
+    smoothed_data = smoothed_data - baseline[np.newaxis, :]
+    smoothed_data = np.maximum(smoothed_data, 0)  # Crack opening is positive
+
+    # =========================================================================
+    # Step 5: Create three-panel figure
+    # =========================================================================
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    # Color settings
+    n_curves = n_images
+    colors = plt.cm.viridis(np.linspace(0, 1, n_curves))
+
+    # Panel 1: Raw data
+    ax1 = axes[0]
+    for i in range(n_images):
+        ax1.plot(x_coords, raw_data[i, :], color=colors[i], alpha=0.7, linewidth=0.8)
+    ax1.set_xlabel("x [px]")
+    ax1.set_ylabel("Max. relative y-displacement [px]")
+    ax1.set_title("Raw data\n(max over all y)")
+    ax1.grid(True, alpha=0.3)
+
+    # Panel 2: Refined (crack region only)
+    ax2 = axes[1]
+    for i in range(n_images):
+        ax2.plot(x_coords, refined_data[i, :], color=colors[i], alpha=0.7, linewidth=0.8)
+    ax2.set_xlabel("x [px]")
+    ax2.set_ylabel("Max. relative y-displacement [px]")
+    ax2.set_title(f"Refined ROI\n(crack region: y = {y_coords[crack_y_min_idx]:.0f}-{y_coords[crack_y_max_idx]:.0f} px)")
+    ax2.grid(True, alpha=0.3)
+
+    # Panel 3: Smoothed data
+    ax3 = axes[2]
+    for i in range(n_images):
+        ax3.plot(x_coords, smoothed_data[i, :], color=colors[i], alpha=0.7, linewidth=0.8)
+    ax3.set_xlabel("x [px]")
+    ax3.set_ylabel("Smoothed relative y-displacement [px]")
+    ax3.set_title(f"Smoothed data\n({smoothing_label}, baseline corrected)")
+    ax3.grid(True, alpha=0.3)
+
+    # Add colorbar for image progression - placed outside on the right
+    sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis, norm=mcolors.Normalize(vmin=1, vmax=n_curves))
+    sm.set_array([])  # Required for ScalarMappable
+    # Create space for colorbar on the right side
+    fig.subplots_adjust(right=0.92)
+    cbar_ax = fig.add_axes([0.94, 0.15, 0.02, 0.7])  # [left, bottom, width, height]
+    cbar = fig.colorbar(sm, cax=cbar_ax)
+    cbar.set_label("Image number")
+
+    plt.suptitle(f"{title}", fontsize=14, fontweight='bold', y=0.98)
+    plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Refined crack analysis saved: {output_path}")
+
+    return {
+        'raw_data': raw_data,
+        'refined_data': refined_data,
+        'smoothed_data': smoothed_data,
+        'crack_y_range': (crack_y_min_idx, crack_y_max_idx),
+        'x_coords': x_coords,
+    }
+
+
 def create_max_displacement_evolution(
     results: List[CrackAnalysisResult],
     config: dict,
@@ -469,6 +740,37 @@ def main():
         action="store_true",
         help="Use pixel coordinates instead of mm"
     )
+    parser.add_argument(
+        "--crack-margin",
+        type=float,
+        default=2.0,
+        help="Margin around crack region in mm (default: 2.0)"
+    )
+    parser.add_argument(
+        "--sigma-x",
+        type=float,
+        default=3.0,
+        help="Gaussian smoothing sigma along x-axis (default: 3.0)"
+    )
+    parser.add_argument(
+        "--sigma-time",
+        type=float,
+        default=2.0,
+        help="Gaussian smoothing sigma along time axis (default: 2.0)"
+    )
+    parser.add_argument(
+        "--smoothing",
+        type=str,
+        choices=["gaussian", "isotonic"],
+        default="gaussian",
+        help="Smoothing method: 'gaussian' (2D filter) or 'isotonic' (monotonic increase over time)"
+    )
+    parser.add_argument(
+        "--title",
+        type=str,
+        default=None,
+        help="Custom title for plots (default: parent directory name)"
+    )
 
     args = parser.parse_args()
 
@@ -501,7 +803,20 @@ def main():
         use_physical_coords=use_physical,
     )
 
-    # 2. Max displacement evolution
+    # 2. Refined crack analysis (three-panel comparison)
+    create_refined_crack_analysis(
+        results, config,
+        output_dir / "refined_crack_analysis.png",
+        crack_margin_mm=args.crack_margin,
+        sigma_x=args.sigma_x,
+        sigma_time=args.sigma_time,
+        smoothing_method=args.smoothing,
+        dpi=args.dpi,
+        use_physical_coords=use_physical,
+        title=args.title,
+    )
+
+    # 3. Max displacement evolution
     create_max_displacement_evolution(
         results, config,
         output_dir / "max_displacement_evolution.png",
@@ -509,7 +824,7 @@ def main():
         use_physical_coords=use_physical,
     )
 
-    # 3. Crack position plot
+    # 4. Crack position plot
     create_crack_position_plot(
         results, config,
         output_dir / "crack_propagation.png",
@@ -518,7 +833,7 @@ def main():
         use_physical_coords=use_physical,
     )
 
-    # 4. Heatmap video (optional)
+    # 5. Heatmap video (optional)
     if not args.no_video:
         create_heatmap_video(
             results, config,
