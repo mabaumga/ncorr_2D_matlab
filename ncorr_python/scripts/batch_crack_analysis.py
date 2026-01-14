@@ -53,8 +53,11 @@ class AnalysisConfig:
     roi_margin: int = 30
 
     # Processing options
-    process_reverse: bool = True  # Process from last to first image
     skip_existing: bool = True    # Skip already processed images
+    seed_retry_grid: int = 5      # Grid size for seed retry (5 = try 5x5 grid around center)
+
+    # Coordinate transformation (applied after DIC)
+    rotation_deg: float = 0.0     # Rotation angle in degrees (counter-clockwise positive)
 
     @property
     def pixels_per_mm(self) -> float:
@@ -248,6 +251,65 @@ def find_max_relative_displacement_per_x(
     return max_values, y_positions
 
 
+def apply_rotation_to_displacements(
+    grid_x: NDArray[np.float64],
+    grid_y: NDArray[np.float64],
+    displacement_u: NDArray[np.float64],
+    displacement_v: NDArray[np.float64],
+    rotation_deg: float,
+) -> Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    """
+    Apply rotation transformation to coordinates and displacement vectors.
+
+    This is a post-DIC coordinate transformation. The rotation is applied to both
+    the coordinate system and the displacement vectors.
+
+    For a rotation by angle θ (counter-clockwise positive):
+    - Coordinates: x' = x*cos(θ) - y*sin(θ), y' = x*sin(θ) + y*cos(θ)
+    - Displacements: u' = u*cos(θ) - v*sin(θ), v' = u*sin(θ) + v*cos(θ)
+
+    Args:
+        grid_x: 1D array of x-coordinates (will be used to create meshgrid)
+        grid_y: 1D array of y-coordinates
+        displacement_u: 2D array of x-displacements (ny, nx)
+        displacement_v: 2D array of y-displacements (ny, nx)
+        rotation_deg: Rotation angle in degrees (counter-clockwise positive)
+
+    Returns:
+        Tuple of (grid_x_rot, grid_y_rot, u_rot, v_rot)
+        Note: Rotated coordinates are 2D arrays matching displacement shape
+    """
+    if abs(rotation_deg) < 1e-10:
+        # No rotation needed
+        return grid_x, grid_y, displacement_u, displacement_v
+
+    # Convert to radians
+    theta = np.radians(rotation_deg)
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+
+    # Create meshgrid for coordinates
+    X, Y = np.meshgrid(grid_x, grid_y)
+
+    # Rotate coordinates (around origin, which is top-left corner)
+    # For image coordinates, we typically want to rotate around the center
+    center_x = (grid_x.max() + grid_x.min()) / 2
+    center_y = (grid_y.max() + grid_y.min()) / 2
+
+    # Translate to center, rotate, translate back
+    X_centered = X - center_x
+    Y_centered = Y - center_y
+
+    X_rot = X_centered * cos_t - Y_centered * sin_t + center_x
+    Y_rot = X_centered * sin_t + Y_centered * cos_t + center_y
+
+    # Rotate displacement vectors
+    u_rot = displacement_u * cos_t - displacement_v * sin_t
+    v_rot = displacement_u * sin_t + displacement_v * cos_t
+
+    return X_rot, Y_rot, u_rot, v_rot
+
+
 class BatchCrackAnalyzer:
     """Batch analyzer for crack propagation in image sequences."""
 
@@ -295,9 +357,29 @@ class BatchCrackAnalyzer:
             subset_trunc=False,
         )
 
-        # Create initial seed at center
+        # Create initial seed positions for retry (grid around center)
         center_x = width // 2
         center_y = height // 2
+        self._image_size = (height, width)
+
+        # Generate grid of seed positions to try
+        grid_size = self.config.seed_retry_grid
+        step_x = (width - 2 * margin) // (grid_size + 1)
+        step_y = (height - 2 * margin) // (grid_size + 1)
+
+        self._seed_positions = []
+        # Start with center
+        self._seed_positions.append((center_x, center_y))
+        # Add grid positions (spiral out from center)
+        for radius in range(1, grid_size):
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    if abs(dx) == radius or abs(dy) == radius:  # Only edge of current ring
+                        sx = center_x + dx * step_x
+                        sy = center_y + dy * step_y
+                        if margin < sx < width - margin and margin < sy < height - margin:
+                            self._seed_positions.append((sx, sy))
+
         self._seeds = [SeedInfo(x=center_x, y=center_y, u=0.0, v=0.0, region_idx=0, valid=True)]
 
     def _get_output_path(self, output_dir: Path, image_name: str) -> Path:
@@ -342,18 +424,40 @@ class BatchCrackAnalyzer:
         cur_array = self._load_image(image_path)
         cur_img = NcorrImage.from_array(cur_array)
 
-        # Run DIC analysis
-        dic = DICAnalysis(self._params)
-        try:
-            results = dic.analyze(self._ref_img, [cur_img], self._roi, self._seeds)
-        except Exception as e:
-            print(f"\nDIC failed for {image_path.name}: {e}")
-            return None
+        # Try DIC analysis with current seeds, retry with alternative positions if needed
+        disp = None
+        seeds_to_try = [self._seeds]
 
-        if not results:
-            return None
+        # If first attempt fails, try alternative seed positions
+        for seed_pos in self._seed_positions:
+            alt_seed = [SeedInfo(x=seed_pos[0], y=seed_pos[1], u=0.0, v=0.0, region_idx=0, valid=True)]
+            seeds_to_try.append(alt_seed)
 
-        disp = results[0]
+        for attempt, seeds in enumerate(seeds_to_try):
+            dic = DICAnalysis(self._params)
+            try:
+                results = dic.analyze(self._ref_img, [cur_img], self._roi, seeds)
+            except Exception as e:
+                if attempt == 0:
+                    # First attempt failed, will try alternatives
+                    continue
+                else:
+                    continue
+
+            if results and len(results) > 0:
+                disp = results[0]
+                # Check if we have enough valid points (more than 10% of expected)
+                valid_count = np.sum(disp.roi)
+                if valid_count > 100:  # Reasonable minimum
+                    if attempt > 0:
+                        print(f"\n  Seed retry successful at position {attempt}: ({seeds[0].x}, {seeds[0].y})")
+                    break
+                else:
+                    disp = None  # Not enough points, try next seed
+
+        if disp is None:
+            print(f"\nDIC failed for {image_path.name}: All seed positions exhausted")
+            return None
 
         # Extract displacement fields
         displacement_u = disp.u.copy()
@@ -367,7 +471,13 @@ class BatchCrackAnalyzer:
         # Compute grid coordinates
         grid_x, grid_y = self._compute_grid_coordinates(displacement_u.shape)
 
-        # Compute strain
+        # Apply rotation transformation if configured (post-DIC)
+        if abs(self.config.rotation_deg) > 1e-10:
+            _, _, displacement_u, displacement_v = apply_rotation_to_displacements(
+                grid_x, grid_y, displacement_u, displacement_v, self.config.rotation_deg
+            )
+
+        # Compute strain (on rotated displacements if applicable)
         strain_calc = StrainCalculator(strain_radius=self.config.strain_radius)
         try:
             strain = strain_calc.calculate_green_lagrange(
@@ -381,7 +491,7 @@ class BatchCrackAnalyzer:
             strain_eyy = np.full_like(displacement_u, np.nan)
             strain_exy = np.full_like(displacement_u, np.nan)
 
-        # Compute relative displacement
+        # Compute relative displacement (uses rotated v if rotation was applied)
         relative_v = compute_relative_displacement(
             displacement_v, grid_y,
             self.config.reference_distance_px,
@@ -453,7 +563,8 @@ class BatchCrackAnalyzer:
         print(f"Reference image (FIXED): {reference_image.name}")
         print(f"Images to process: {len(current_images)} (from {current_images[0].name} to {current_images[-1].name})")
         print(f"Output directory: {output_dir}")
-        print(f"Processing order: {'reverse (last→first)' if self.config.process_reverse else 'forward (first→last)'}")
+        if abs(self.config.rotation_deg) > 1e-10:
+            print(f"Post-DIC rotation: {self.config.rotation_deg}°")
         print(f"NOTE: All images are compared against the reference: {reference_image.name}")
 
         # Save configuration
@@ -471,19 +582,11 @@ class BatchCrackAnalyzer:
         self._setup_reference(reference_image)
         self._reference_name = reference_image.name  # Store for results
 
-        # Determine processing order
-        if self.config.process_reverse:
-            # Process from last to first (largest crack first)
-            process_order = list(reversed(range(len(current_images))))
-        else:
-            process_order = list(range(len(current_images)))
-
-        # Process images
+        # Process images in forward order (first to last)
         results = []
         skipped = 0
 
-        desc = "Analyzing images (reverse)" if self.config.process_reverse else "Analyzing images"
-        pbar = tqdm(process_order, desc=desc, unit="img")
+        pbar = tqdm(range(len(current_images)), desc="Analyzing images", unit="img")
 
         for idx in pbar:
             image_path = current_images[idx]
@@ -575,9 +678,10 @@ def main():
         help="Margin from image edges for ROI (default: 30)"
     )
     parser.add_argument(
-        "--no-reverse",
-        action="store_true",
-        help="Process images in forward order (default: reverse)"
+        "--rotation",
+        type=float,
+        default=0.0,
+        help="Post-DIC rotation in degrees (counter-clockwise positive, default: 0)"
     )
     parser.add_argument(
         "--no-skip",
@@ -595,7 +699,7 @@ def main():
         subset_spacing=args.subset_spacing,
         strain_radius=args.strain_radius,
         roi_margin=args.roi_margin,
-        process_reverse=not args.no_reverse,
+        rotation_deg=args.rotation,
         skip_existing=not args.no_skip,
     )
 
