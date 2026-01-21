@@ -54,17 +54,35 @@ Images are loaded as grayscale arrays $I: \Omega \to [0, 255]$, where $\Omega \s
 
 The first image in the alphabetically sorted sequence is designated as the \textbf{reference image} $I_{\text{ref}}$. All subsequent images $I_k$ (for $k = 1, 2, \ldots, N$) are compared against this fixed reference.
 
-\subsection{Coordinate System}
+\subsection{Coordinate System and Resolution}
 
 The pixel coordinate system uses:
 \begin{itemize}
     \item Origin at top-left corner
     \item $x$-axis pointing right (horizontal)
     \item $y$-axis pointing down (vertical)
-    \item Physical scaling: $s = \frac{W_{\text{px}}}{W_{\text{mm}}}$ [px/mm]
 \end{itemize}
 
-where $W_{\text{px}}$ is the image width in pixels and $W_{\text{mm}}$ is the physical width in millimeters.
+\subsubsection{Resolution}
+
+The image resolution $r$ is specified in micrometers per pixel [$\mu$m/px]. This is the primary scaling parameter:
+\begin{equation}
+    r = \frac{\Delta x_{\text{physical}}}{\Delta x_{\text{pixel}}} \quad [\mu\text{m/px}]
+\end{equation}
+
+Derived quantities:
+\begin{align}
+    \text{Pixels per mm:} \quad s &= \frac{1000}{r} \quad [\text{px/mm}] \\
+    \text{Physical displacement:} \quad u_{\text{mm}} &= u_{\text{px}} \cdot \frac{r}{1000} \quad [\text{mm}] \\
+    \text{Physical displacement:} \quad u_{\mu\text{m}} &= u_{\text{px}} \cdot r \quad [\mu\text{m}]
+\end{align}
+
+For example, with $r = 20$ $\mu$m/px:
+\begin{itemize}
+    \item 1 pixel = 20 $\mu$m = 0.02 mm
+    \item 1 mm = 50 pixels
+    \item A displacement of 5 px corresponds to 100 $\mu$m
+\end{itemize}
 
 %=============================================================================
 \section{Digital Image Correlation (DIC)}

@@ -37,9 +37,8 @@ from ncorr.algorithms.strain import StrainCalculator
 class AnalysisConfig:
     """Configuration for batch crack analysis."""
 
-    # Image scaling
-    image_width_px: int = 6000
-    image_width_mm: float = 120.0
+    # Image scaling - resolution in micrometers per pixel
+    resolution_um_per_px: float = 20.0  # µm/pixel (e.g., 6000px = 120mm → 20 µm/px)
 
     # Relative displacement calculation
     reference_distance_mm: float = 1.0  # Distance over which to compute relative displacement
@@ -62,7 +61,12 @@ class AnalysisConfig:
     @property
     def pixels_per_mm(self) -> float:
         """Pixels per millimeter."""
-        return self.image_width_px / self.image_width_mm
+        return 1000.0 / self.resolution_um_per_px
+
+    @property
+    def um_per_px(self) -> float:
+        """Micrometers per pixel (alias for resolution)."""
+        return self.resolution_um_per_px
 
     @property
     def reference_distance_px(self) -> int:
@@ -78,6 +82,7 @@ class AnalysisConfig:
         """Convert to dictionary for JSON serialization."""
         d = asdict(self)
         d['pixels_per_mm'] = self.pixels_per_mm
+        d['um_per_px'] = self.um_per_px
         d['reference_distance_px'] = self.reference_distance_px
         d['grid_step'] = self.grid_step
         return d
@@ -335,11 +340,6 @@ class BatchCrackAnalyzer:
 
         height, width = ref_array.shape
 
-        # Update image width in config if different
-        if width != self.config.image_width_px:
-            print(f"Note: Image width is {width}px, updating config from {self.config.image_width_px}px")
-            self.config.image_width_px = width
-
         # Create ROI (full image minus margins)
         margin = self.config.roi_margin
         mask = np.zeros((height, width), dtype=np.bool_)
@@ -563,6 +563,8 @@ class BatchCrackAnalyzer:
         print(f"Reference image (FIXED): {reference_image.name}")
         print(f"Images to process: {len(current_images)} (from {current_images[0].name} to {current_images[-1].name})")
         print(f"Output directory: {output_dir}")
+        print(f"Resolution: {self.config.resolution_um_per_px:.2f} µm/pixel ({self.config.pixels_per_mm:.1f} px/mm)")
+        print(f"Reference distance: {self.config.reference_distance_mm} mm = {self.config.reference_distance_px} px")
         if abs(self.config.rotation_deg) > 1e-10:
             print(f"Post-DIC rotation: {self.config.rotation_deg}°")
         print(f"NOTE: All images are compared against the reference: {reference_image.name}")
@@ -648,10 +650,10 @@ def main():
         help="Reference distance in mm for relative displacement (default: 1.0)"
     )
     parser.add_argument(
-        "--image-width-mm",
+        "--resolution",
         type=float,
-        default=120.0,
-        help="Physical width of image in mm (default: 120.0)"
+        default=20.0,
+        help="Image resolution in µm/pixel (default: 20.0)"
     )
     parser.add_argument(
         "--subset-radius",
@@ -693,7 +695,7 @@ def main():
 
     # Create configuration
     config = AnalysisConfig(
-        image_width_mm=args.image_width_mm,
+        resolution_um_per_px=args.resolution,
         reference_distance_mm=args.reference_distance,
         subset_radius=args.subset_radius,
         subset_spacing=args.subset_spacing,
