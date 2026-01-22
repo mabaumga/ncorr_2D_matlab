@@ -486,7 +486,8 @@ class BatchCrackAnalyzer:
             strain_exx = strain.exx.copy()
             strain_eyy = strain.eyy.copy()
             strain_exy = strain.exy.copy()
-        except Exception:
+        except Exception as e:
+            print(f"\n  Warning: Strain calculation failed: {e}")
             strain_exx = np.full_like(displacement_u, np.nan)
             strain_eyy = np.full_like(displacement_u, np.nan)
             strain_exy = np.full_like(displacement_u, np.nan)
