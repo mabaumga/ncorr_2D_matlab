@@ -131,6 +131,7 @@ def create_heatmap_video(
     results: List[CrackAnalysisResult],
     config: dict,
     output_path: Path,
+    field: str = "relative_v",
     fps: int = 10,
     dpi: int = 150,
     vmin: Optional[float] = None,
@@ -138,12 +139,19 @@ def create_heatmap_video(
     use_physical_coords: bool = True,
 ):
     """
-    Create a video showing relative y-displacement heatmaps over all cycles.
+    Create a video showing field heatmaps over all cycles.
 
     Args:
         results: List of analysis results
         config: Analysis configuration
         output_path: Path for output video file
+        field: Field to visualize. Options:
+            - "displacement_u": x-displacement [px]
+            - "displacement_v": y-displacement [px]
+            - "strain_exx": normal strain in x-direction [-]
+            - "strain_eyy": normal strain in y-direction [-]
+            - "strain_exy": shear strain [-]
+            - "relative_v": relative y-displacement over reference distance [px]
         fps: Frames per second
         dpi: Resolution
         vmin: Minimum value for colorbar (auto if None)
@@ -154,11 +162,65 @@ def create_heatmap_video(
         print("No results to visualize")
         return
 
+    # Field configuration: attribute name, colorbar label, title prefix, colormap
+    field_config = {
+        "displacement_u": {
+            "attr": "displacement_u",
+            "label": "x-displacement [px]",
+            "title": "Displacement u",
+            "cmap": "RdBu_r",
+            "symmetric": True,
+        },
+        "displacement_v": {
+            "attr": "displacement_v",
+            "label": "y-displacement [px]",
+            "title": "Displacement v",
+            "cmap": "RdBu_r",
+            "symmetric": True,
+        },
+        "strain_exx": {
+            "attr": "strain_exx",
+            "label": "Strain $\\varepsilon_{xx}$ [-]",
+            "title": "Strain exx",
+            "cmap": "RdBu_r",
+            "symmetric": True,
+        },
+        "strain_eyy": {
+            "attr": "strain_eyy",
+            "label": "Strain $\\varepsilon_{yy}$ [-]",
+            "title": "Strain eyy",
+            "cmap": "RdBu_r",
+            "symmetric": True,
+        },
+        "strain_exy": {
+            "attr": "strain_exy",
+            "label": "Strain $\\varepsilon_{xy}$ [-]",
+            "title": "Strain exy",
+            "cmap": "RdBu_r",
+            "symmetric": True,
+        },
+        "relative_v": {
+            "attr": "relative_v",
+            "label": "Relative y-displacement [px]",
+            "title": f"Relative v (over {config.get('reference_distance_mm', 1.0):.1f} mm)",
+            "cmap": "RdBu_r",
+            "symmetric": True,
+        },
+    }
+
+    if field not in field_config:
+        print(f"Unknown field '{field}'. Available fields: {list(field_config.keys())}")
+        return
+
+    fc = field_config[field]
+    attr_name = fc["attr"]
+
     # Determine color scale from all data
     if vmin is None or vmax is None:
         all_values = []
         for r in results:
-            valid = r.relative_v[~np.isnan(r.relative_v)]
+            data = getattr(r, attr_name)
+            valid = data[~np.isnan(data)]
             if len(valid) > 0:
                 all_values.extend(valid.flatten())
         if all_values:
@@ -169,8 +231,8 @@ def create_heatmap_video(
         else:
             vmin, vmax = -1, 1
 
-    # Use symmetric colorbar if data crosses zero
-    if vmin < 0 < vmax:
+    # Use symmetric colorbar if configured and data crosses zero
+    if fc["symmetric"] and vmin < 0 < vmax:
         abs_max = max(abs(vmin), abs(vmax))
         vmin, vmax = -abs_max, abs_max
 
@@ -195,27 +257,28 @@ def create_heatmap_video(
         ylabel = "y [px]"
 
     # Initial heatmap
+    initial_data = getattr(results[0], attr_name)
     im = ax.imshow(
-        results[0].relative_v,
+        initial_data,
         extent=extent,
         aspect='auto',
-        cmap='RdBu_r',
+        cmap=fc["cmap"],
         vmin=vmin,
         vmax=vmax,
         origin='upper',
     )
 
-    cbar = fig.colorbar(im, ax=ax, label="Relative y-displacement [px]")
+    cbar = fig.colorbar(im, ax=ax, label=fc["label"])
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
 
-    ref_distance = config.get('reference_distance_mm', 1.0)
-    title = ax.set_title(f"Relative v (over {ref_distance:.1f} mm) - Image 1/{len(results)}")
+    title = ax.set_title(f"{fc['title']} - Image 1/{len(results)}")
 
     def update(frame):
         r = results[frame]
-        im.set_array(r.relative_v)
-        title.set_text(f"Relative v (over {ref_distance:.1f} mm) - {r.image_name}")
+        data = getattr(r, attr_name)
+        im.set_array(data)
+        title.set_text(f"{fc['title']} - {r.image_name}")
         return [im, title]
 
     # Create animation
@@ -236,12 +299,12 @@ def create_heatmap_video(
         print("To enable MP4: pip install imageio-ffmpeg")
         output_path = output_path.with_suffix('.gif')
 
-    print(f"Saving video to {output_path}...")
+    print(f"Saving video ({field}) to {output_path}...")
 
     if use_ffmpeg:
         # Configure matplotlib to use the found FFmpeg path
         plt.rcParams['animation.ffmpeg_path'] = ffmpeg_path
-        writer = FFMpegWriter(fps=fps, metadata={'title': 'Crack Analysis'})
+        writer = FFMpegWriter(fps=fps, metadata={'title': f'Crack Analysis - {fc["title"]}'})
     else:
         writer = PillowWriter(fps=fps)
 
@@ -623,6 +686,13 @@ def main():
         help="Skip video generation"
     )
     parser.add_argument(
+        "--video-field",
+        type=str,
+        choices=["displacement_u", "displacement_v", "strain_exx", "strain_eyy", "strain_exy", "relative_v"],
+        default="relative_v",
+        help="Field to show in video: displacement_u/v, strain_exx/eyy/exy, relative_v (default: relative_v)"
+    )
+    parser.add_argument(
         "--pixels",
         action="store_true",
         help="Use pixel coordinates instead of mm"
@@ -705,9 +775,11 @@ def main():
 
     # 3. Heatmap video (optional)
     if not args.no_video:
+        video_filename = f"{args.video_field}.mp4"
         create_heatmap_video(
             results, config,
-            output_dir / "relative_displacement.mp4",
+            output_dir / video_filename,
+            field=args.video_field,
             fps=args.video_fps,
             dpi=args.dpi,
             use_physical_coords=use_physical,
