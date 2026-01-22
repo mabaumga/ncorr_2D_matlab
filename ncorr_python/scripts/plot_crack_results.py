@@ -199,6 +199,13 @@ def create_heatmap_video(
             "cmap": "RdBu_r",
             "symmetric": True,
         },
+        "relative_u": {
+            "attr": "relative_u",
+            "label": "Relative x-displacement [px]",
+            "title": f"Relative u (over {config.get('reference_distance_mm', 1.0):.1f} mm)",
+            "cmap": "RdBu_r",
+            "symmetric": True,
+        },
         "relative_v": {
             "attr": "relative_v",
             "label": "Relative y-displacement [px]",
@@ -688,9 +695,9 @@ def main():
     parser.add_argument(
         "--video-field",
         type=str,
-        choices=["displacement_u", "displacement_v", "strain_exx", "strain_eyy", "strain_exy", "relative_v"],
+        choices=["displacement_u", "displacement_v", "strain_exx", "strain_eyy", "strain_exy", "relative_u", "relative_v"],
         default="relative_v",
-        help="Field to show in video: displacement_u/v, strain_exx/eyy/exy, relative_v (default: relative_v)"
+        help="Field to show in video: displacement_u/v, strain_exx/eyy/exy, relative_u/v (default: relative_v)"
     )
     parser.add_argument(
         "--pixels",

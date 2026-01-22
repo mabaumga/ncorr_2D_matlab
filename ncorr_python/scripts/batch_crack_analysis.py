@@ -121,7 +121,8 @@ class CrackAnalysisResult:
     valid_mask: NDArray[np.bool_]
 
     # Relative displacement fields (computed over reference distance)
-    relative_v: NDArray[np.float64]  # Relative y-displacement
+    relative_u: NDArray[np.float64]  # Relative x-displacement (along x-axis)
+    relative_v: NDArray[np.float64]  # Relative y-displacement (along y-axis)
 
     # Crack analysis results
     max_relative_v_per_x: NDArray[np.float64]  # Max relative v for each x position
@@ -146,6 +147,7 @@ class CrackAnalysisResult:
             strain_eyy=self.strain_eyy,
             strain_exy=self.strain_exy,
             valid_mask=self.valid_mask,
+            relative_u=self.relative_u,
             relative_v=self.relative_v,
             max_relative_v_per_x=self.max_relative_v_per_x,
             max_relative_v_y_position=self.max_relative_v_y_position,
@@ -169,6 +171,7 @@ class CrackAnalysisResult:
             strain_eyy=data['strain_eyy'],
             strain_exy=data['strain_exy'],
             valid_mask=data['valid_mask'],
+            relative_u=data['relative_u'] if 'relative_u' in data else np.full_like(data['relative_v'], np.nan),
             relative_v=data['relative_v'],
             max_relative_v_per_x=data['max_relative_v_per_x'],
             max_relative_v_y_position=data['max_relative_v_y_position'],
@@ -223,6 +226,45 @@ def compute_relative_displacement(
         relative_v[i, :] = v_plus - v_minus
 
     return relative_v
+
+
+def compute_relative_displacement_x(
+    displacement_u: NDArray[np.float64],
+    grid_x: NDArray[np.float64],
+    reference_distance_px: int,
+    grid_step: int,
+) -> NDArray[np.float64]:
+    """
+    Compute relative displacement in x-direction over a reference distance.
+
+    For each point, computes u(x + d/2) - u(x - d/2) where d is the reference distance.
+    This approximates strain_xx * d for small deformations.
+
+    Args:
+        displacement_u: 2D array of x-displacements (ny, nx)
+        grid_x: 1D array of x-coordinates
+        reference_distance_px: Distance in pixels over which to compute relative displacement
+        grid_step: Grid spacing in pixels
+
+    Returns:
+        2D array of relative displacements (same shape as input)
+    """
+    ny, nx = displacement_u.shape
+    relative_u = np.full_like(displacement_u, np.nan)
+
+    # Number of grid points for half the reference distance
+    half_dist_points = int(round(reference_distance_px / (2 * grid_step)))
+
+    if half_dist_points < 1:
+        half_dist_points = 1
+
+    # Compute relative displacement along x-axis
+    for j in range(half_dist_points, nx - half_dist_points):
+        u_plus = displacement_u[:, j + half_dist_points]
+        u_minus = displacement_u[:, j - half_dist_points]
+        relative_u[:, j] = u_plus - u_minus
+
+    return relative_u
 
 
 def find_max_relative_displacement_per_x(
@@ -477,11 +519,14 @@ class BatchCrackAnalyzer:
                 grid_x, grid_y, displacement_u, displacement_v, self.config.rotation_deg
             )
 
-        # Compute strain (on rotated displacements if applicable)
+        # Compute strain - create temporary ROI from displacement result mask
+        # IMPORTANT: disp.roi has the same size as disp.u/v, not the original image!
         strain_calc = StrainCalculator(strain_radius=self.config.strain_radius)
         try:
+            temp_roi = NcorrROI()
+            temp_roi.set_roi("load", {"mask": disp.roi, "cutoff": 0})
             strain = strain_calc.calculate_green_lagrange(
-                disp.u, disp.v, self._roi, self.config.grid_step
+                disp.u, disp.v, temp_roi, self.config.grid_step
             )
             strain_exx = strain.exx.copy()
             strain_eyy = strain.eyy.copy()
@@ -492,7 +537,12 @@ class BatchCrackAnalyzer:
             strain_eyy = np.full_like(displacement_u, np.nan)
             strain_exy = np.full_like(displacement_u, np.nan)
 
-        # Compute relative displacement (uses rotated v if rotation was applied)
+        # Compute relative displacements (uses rotated u/v if rotation was applied)
+        relative_u = compute_relative_displacement_x(
+            displacement_u, grid_x,
+            self.config.reference_distance_px,
+            self.config.grid_step
+        )
         relative_v = compute_relative_displacement(
             displacement_v, grid_y,
             self.config.reference_distance_px,
@@ -522,6 +572,7 @@ class BatchCrackAnalyzer:
             strain_eyy=strain_eyy,
             strain_exy=strain_exy,
             valid_mask=valid_mask,
+            relative_u=relative_u,
             relative_v=relative_v,
             max_relative_v_per_x=max_rel_v,
             max_relative_v_y_position=max_rel_y,

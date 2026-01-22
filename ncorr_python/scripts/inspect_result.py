@@ -73,12 +73,18 @@ def visualize_result(result: CrackAnalysisResult, output_path: Path = None, dpi:
     print(f"{'='*60}")
 
     # Collect all 2D fields
+    # Handle backward compatibility for relative_u
+    relative_u = getattr(result, 'relative_u', None)
+    if relative_u is None:
+        relative_u = np.full_like(result.relative_v, np.nan)
+
     fields_2d = {
         'displacement_u': ('Displacement u [px]', result.displacement_u),
         'displacement_v': ('Displacement v [px]', result.displacement_v),
         'strain_exx': ('Strain $\\varepsilon_{xx}$ [-]', result.strain_exx),
         'strain_eyy': ('Strain $\\varepsilon_{yy}$ [-]', result.strain_eyy),
         'strain_exy': ('Strain $\\varepsilon_{xy}$ [-]', result.strain_exy),
+        'relative_u': ('Relative u [px]', relative_u),
         'relative_v': ('Relative v [px]', result.relative_v),
         'valid_mask': ('Valid Mask', result.valid_mask.astype(float)),
     }
@@ -107,20 +113,21 @@ def visualize_result(result: CrackAnalysisResult, output_path: Path = None, dpi:
     print_field_stats('grid_y_mm', result.grid_y_mm)
 
     # Create visualization
-    fig = plt.figure(figsize=(20, 16))
+    fig = plt.figure(figsize=(20, 20))
 
-    # 2D fields (3 rows x 3 cols for 7 fields + 2 for 1D)
+    # 2D fields (4 rows x 3 cols for 8 2D fields + 2 1D fields + 2 empty)
     n_2d = len(fields_2d)
     n_1d = len(fields_1d)
 
-    # Grid layout: 3 rows, 3 columns
-    # Row 1: displacement_u, displacement_v, relative_v
+    # Grid layout: 4 rows, 3 columns
+    # Row 1: displacement_u, displacement_v, valid_mask
     # Row 2: strain_exx, strain_eyy, strain_exy
-    # Row 3: valid_mask, max_relative_v_per_x, max_relative_v_y_position
+    # Row 3: relative_u, relative_v, (empty)
+    # Row 4: max_relative_v_per_x, max_relative_v_y_position, (empty)
 
-    field_order_2d = ['displacement_u', 'displacement_v', 'relative_v',
+    field_order_2d = ['displacement_u', 'displacement_v', 'valid_mask',
                       'strain_exx', 'strain_eyy', 'strain_exy',
-                      'valid_mask']
+                      'relative_u', 'relative_v']
 
     # Get extent for 2D plots
     extent = [result.grid_x[0], result.grid_x[-1],
@@ -128,7 +135,7 @@ def visualize_result(result: CrackAnalysisResult, output_path: Path = None, dpi:
 
     # Plot 2D fields
     for idx, name in enumerate(field_order_2d):
-        ax = fig.add_subplot(3, 3, idx + 1)
+        ax = fig.add_subplot(4, 3, idx + 1)
         label, data = fields_2d[name]
 
         if name == 'valid_mask':
@@ -167,28 +174,28 @@ def visualize_result(result: CrackAnalysisResult, output_path: Path = None, dpi:
                        transform=ax.transAxes, va='top', fontsize=8,
                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-    # Plot 1D fields
-    ax8 = fig.add_subplot(3, 3, 8)
+    # Plot 1D fields (row 4)
+    ax10 = fig.add_subplot(4, 3, 10)
     label, data = fields_1d['max_relative_v_per_x']
     valid = ~np.isnan(data)
-    ax8.plot(result.grid_x[valid], data[valid], 'b-', linewidth=1)
-    ax8.set_xlabel('x [px]')
-    ax8.set_ylabel(label)
-    ax8.set_title('Max relative v per x-position')
-    ax8.grid(True, alpha=0.3)
+    ax10.plot(result.grid_x[valid], data[valid], 'b-', linewidth=1)
+    ax10.set_xlabel('x [px]')
+    ax10.set_ylabel(label)
+    ax10.set_title('Max relative v per x-position')
+    ax10.grid(True, alpha=0.3)
     if np.any(valid):
-        ax8.text(0.02, 0.98, f"max={np.nanmax(np.abs(data)):.3g}",
-                transform=ax8.transAxes, va='top', fontsize=8,
+        ax10.text(0.02, 0.98, f"max={np.nanmax(np.abs(data)):.3g}",
+                transform=ax10.transAxes, va='top', fontsize=8,
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-    ax9 = fig.add_subplot(3, 3, 9)
+    ax11 = fig.add_subplot(4, 3, 11)
     label, data = fields_1d['max_relative_v_y_position']
     valid = ~np.isnan(data)
-    ax9.plot(result.grid_x[valid], data[valid], 'r-', linewidth=1)
-    ax9.set_xlabel('x [px]')
-    ax9.set_ylabel(label)
-    ax9.set_title('Y-position of max relative v (crack location)')
-    ax9.grid(True, alpha=0.3)
+    ax11.plot(result.grid_x[valid], data[valid], 'r-', linewidth=1)
+    ax11.set_xlabel('x [px]')
+    ax11.set_ylabel(label)
+    ax11.set_title('Y-position of max relative v (crack location)')
+    ax11.grid(True, alpha=0.3)
 
     plt.suptitle(f"Result Inspection: {result.image_name}\n"
                  f"(Index: {result.image_index}, Reference: {result.reference_image})",
