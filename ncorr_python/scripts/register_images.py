@@ -12,8 +12,8 @@ Usage:
     # With predefined points (x1,y1 for image1, x2,y2 for image2)
     python register_images.py image1.png image2.png --points "100,100:102,98" "500,100:503,97" "300,400:305,402"
 
-    # Using template matching on specified regions
-    python register_images.py image1.png image2.png --regions "100,100,50,50" "500,100,50,50" "300,400,50,50"
+    # Using template matching on specified regions (x,y,radius)
+    python register_images.py image1.png image2.png --regions "100,100,25" "500,100,25" "300,400,25"
 """
 
 from __future__ import annotations
@@ -118,7 +118,7 @@ class InteractivePointSelector:
 
 
 def find_region_correspondence(img1: np.ndarray, img2: np.ndarray,
-                                region: Tuple[int, int, int, int],
+                                region: Tuple[int, int, int],
                                 search_margin: int = 50) -> Optional[PointPair]:
     """
     Find corresponding point in img2 for a region in img1 using template matching.
@@ -126,27 +126,41 @@ def find_region_correspondence(img1: np.ndarray, img2: np.ndarray,
     Args:
         img1: Reference image
         img2: Image to search in
-        region: (x, y, width, height) of region in img1
+        region: (x, y, radius) - center point and radius of circular region in img1
         search_margin: How far to search around the original position
 
     Returns:
         PointPair with the center of matched regions, or None if failed
     """
-    x, y, w, h = region
+    x, y, r = region
+
+    # Convert center + radius to bounding box
+    # Template is a square with side length 2*r
+    x1 = max(0, x - r)
+    y1 = max(0, y - r)
+    x2 = min(img1.shape[1], x + r)
+    y2 = min(img1.shape[0], y + r)
+
+    w = x2 - x1
+    h = y2 - y1
 
     # Extract template from img1
-    template = img1[y:y+h, x:x+w]
+    template = img1[y1:y2, x1:x2]
+
+    if template.size == 0:
+        print(f"  Warning: Empty template for region ({x}, {y}, r={r})")
+        return None
 
     # Define search area in img2 (expanded region)
-    search_x1 = max(0, x - search_margin)
-    search_y1 = max(0, y - search_margin)
-    search_x2 = min(img2.shape[1], x + w + search_margin)
-    search_y2 = min(img2.shape[0], y + h + search_margin)
+    search_x1 = max(0, x - r - search_margin)
+    search_y1 = max(0, y - r - search_margin)
+    search_x2 = min(img2.shape[1], x + r + search_margin)
+    search_y2 = min(img2.shape[0], y + r + search_margin)
 
     search_area = img2[search_y1:search_y2, search_x1:search_x2]
 
     if search_area.shape[0] < h or search_area.shape[1] < w:
-        print(f"  Warning: Search area too small for region ({x}, {y})")
+        print(f"  Warning: Search area too small for region ({x}, {y}, r={r})")
         return None
 
     # Template matching
@@ -161,16 +175,18 @@ def find_region_correspondence(img1: np.ndarray, img2: np.ndarray,
     _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
     if max_val < 0.5:
-        print(f"  Warning: Low match quality ({max_val:.2f}) for region ({x}, {y})")
+        print(f"  Warning: Low match quality ({max_val:.2f}) for region ({x}, {y}, r={r})")
         return None
 
     # Calculate center points
-    pt1_center = (x + w // 2, y + h // 2)
+    # pt1 is the original center
+    pt1_center = (x, y)
+    # pt2 is where the template was found + offset to center
     pt2_x = search_x1 + max_loc[0] + w // 2
     pt2_y = search_y1 + max_loc[1] + h // 2
     pt2_center = (pt2_x, pt2_y)
 
-    print(f"  Region ({x}, {y}): matched at ({pt2_x}, {pt2_y}), quality={max_val:.3f}")
+    print(f"  Region ({x}, {y}, r={r}): matched at ({pt2_x}, {pt2_y}), quality={max_val:.3f}")
 
     return PointPair(pt1=pt1_center, pt2=pt2_center)
 
@@ -311,11 +327,11 @@ def parse_point_pair(s: str) -> PointPair:
     return PointPair(pt1=p1, pt2=p2)
 
 
-def parse_region(s: str) -> Tuple[int, int, int, int]:
-    """Parse region from string format 'x,y,w,h'."""
+def parse_region(s: str) -> Tuple[int, int, int]:
+    """Parse region from string format 'x,y,radius'."""
     parts = list(map(int, s.split(',')))
-    if len(parts) != 4:
-        raise ValueError(f"Invalid region format: {s}")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid region format: {s} (expected 'x,y,radius')")
     return tuple(parts)
 
 
@@ -332,9 +348,9 @@ Examples:
   python register_images.py ref.png target.png \\
       --points "100,100:102,98" "500,100:503,97" "300,400:305,402"
 
-  # Using template matching on regions (x,y,w,h)
+  # Using template matching on regions (x,y,radius)
   python register_images.py ref.png target.png \\
-      --regions "100,100,50,50" "500,100,50,50" "300,400,50,50"
+      --regions "100,100,25" "500,100,25" "300,400,25"
 """
     )
     parser.add_argument(
@@ -370,7 +386,7 @@ Examples:
         nargs='+',
         type=str,
         default=None,
-        help="Regions for template matching in format 'x,y,w,h' (at least 3)"
+        help="Regions for template matching in format 'x,y,radius' (at least 3)"
     )
     parser.add_argument(
         "--search-margin",
