@@ -119,7 +119,8 @@ class InteractivePointSelector:
 
 def find_region_correspondence(img1: np.ndarray, img2: np.ndarray,
                                 region: Tuple[int, int, int],
-                                search_margin: int = 50) -> Optional[PointPair]:
+                                search_margin: int = 50,
+                                min_quality: float = 0.5) -> Optional[PointPair]:
     """
     Find corresponding point in img2 for a region in img1 using template matching.
 
@@ -128,6 +129,7 @@ def find_region_correspondence(img1: np.ndarray, img2: np.ndarray,
         img2: Image to search in
         region: (x, y, radius) - center point and radius of circular region in img1
         search_margin: How far to search around the original position
+        min_quality: Minimum match quality threshold (0.0-1.0)
 
     Returns:
         PointPair with the center of matched regions, or None if failed
@@ -174,8 +176,8 @@ def find_region_correspondence(img1: np.ndarray, img2: np.ndarray,
     result = cv2.matchTemplate(search_gray, template_gray, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
-    if max_val < 0.5:
-        print(f"  Warning: Low match quality ({max_val:.2f}) for region ({x}, {y}, r={r})")
+    if max_val < min_quality:
+        print(f"  Warning: Low match quality ({max_val:.2f} < {min_quality}) for region ({x}, {y}, r={r})")
         return None
 
     # Calculate center points
@@ -395,6 +397,12 @@ Examples:
         help="Search margin for template matching (default: 100)"
     )
     parser.add_argument(
+        "--min-quality",
+        type=float,
+        default=0.5,
+        help="Minimum match quality threshold 0.0-1.0 (default: 0.5)"
+    )
+    parser.add_argument(
         "--num-points", "-n",
         type=int,
         default=3,
@@ -458,7 +466,7 @@ Examples:
         print(f"\nFinding correspondences using template matching:")
         for r_str in args.regions:
             region = parse_region(r_str)
-            pair = find_region_correspondence(img1, img2, region, args.search_margin)
+            pair = find_region_correspondence(img1, img2, region, args.search_margin, args.min_quality)
             if pair:
                 pairs.append(pair)
 
